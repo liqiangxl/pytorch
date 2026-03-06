@@ -98,6 +98,44 @@ class TestCodegenTriton(InductorTestCase):
             ),
         )
 
+    @inductor_config.patch("triton.divisible_by_16", True)
+    def test_config_of_dynamic_shapes_hint_divisibility(self):
+        """Guard-based tt.divisibility=16 for backed symbolic SizeArgs.
+
+        When dynamic=True, numel args are symbolic but have concrete backing
+        values. If the backing value is divisible by 16, config_of() should
+        install a guard and emit the hint, recovering vectorization.
+        """
+        from torch._dynamo.source import ConstantSource
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv()
+        s0 = shape_env.create_symbol(512, source=ConstantSource("s0"))
+        s1 = shape_env.create_symbol(2048, source=ConstantSource("s1"))
+        s2 = shape_env.create_symbol(13, source=ConstantSource("s2"))
+
+        gm = torch.fx.symbolic_trace(
+            type("M", (torch.nn.Module,), {"forward": lambda self, x: x * 2})()
+        )
+        graph = GraphLowering(gm, shape_env=shape_env)
+
+        with V.set_graph_handler(graph):
+            cfg = triton_utils.config_of(
+                [
+                    SizeArg("xnumel", s0 * s1),  # 0: 1048576, div by 16
+                    SizeArg("r0_numel", s0),  # 1: 512, div by 16
+                    SizeArg("r1_numel", s2),  # 2: 13, NOT div by 16
+                    SizeArg("ks0", s0 * s2),  # 3: 6656, div by 16
+                ]
+            )
+
+        # cfg is a dict like {(idx,): [["tt.divisibility", 16]], ...}
+        if not isinstance(cfg, dict):
+            self.skipTest("Test only applies to dict-based Triton attrs API")
+        for idx in (0, 1, 3):
+            self.assertIn(["tt.divisibility", 16], cfg[(idx,)])
+        self.assertNotIn((2,), cfg)
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests

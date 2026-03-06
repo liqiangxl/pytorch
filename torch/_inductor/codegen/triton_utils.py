@@ -258,6 +258,25 @@ def config_of(
             for i, arg in zip(indices, args)
             if is_aligned(arg, alignment=16, include_tensor=True)
         )
+        # Use the concrete hint value to determine if we can consider
+        # this arg as divisible by 16 and install guards if so.
+        # This recovers vectorization for dynamic=True compilation
+        # where symbolic proof fails but the concrete shape is aligned.
+        # If a future input breaks this guard, Dynamo recompiles.
+        for i, arg in zip(indices, args):
+            if i in divisible_by_16:
+                continue
+            if isinstance(arg, SizeArg) and arg.expr is not None:
+                if isinstance(arg.expr, float):
+                    continue
+                try:
+                    hint = V.graph.sizevars.guarding_hint_or_throw(arg.expr)
+                except Exception:
+                    continue
+                if hint % 16 == 0:
+                    guard_expr = sympy.Eq(arg.expr % 16, 0)
+                    V.graph.sizevars.expect_true(guard_expr)
+                    divisible_by_16 = divisible_by_16 + (i,)
     else:
         divisible_by_16 = ()
 
