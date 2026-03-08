@@ -107,15 +107,12 @@ from .simd import (
     SIMDScheduling,
 )
 from .triton_utils import (
-    apply_hints,
     config_of,
     equal_1_arg_indices,
-    HintCheckType,
+    fast_variant_config,
     non_constexpr_signature,
     should_unwrap_unspec_arg,
     signature_to_meta,
-    speculative_hints,
-    SpeculativeHint,
 )
 from .wrapper import SymbolicCallArg
 
@@ -5625,23 +5622,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # compilation with known shapes.
         if not V.graph.cpp_wrapper:
             base_config = config_of(signature)
-            hints = speculative_hints(signature, base_config)
+            fast_config, check_args = fast_variant_config(signature, base_config)
         else:
-            hints = []
+            fast_config, check_args = None, None
 
-        if hints:
-            # Fast variant: all speculative SizeArgs annotated as divisible by 16,
-            # enabling Triton to emit vectorized loads (LDG.E.128 vs LDG.E.16)
-            fast_config = apply_hints(signature, hints)
+        if fast_config is not None and check_args is not None:
             triton_meta["configs"] = [fast_config]
-            self.speculative_hints = hints
+            self._variant_check_args = check_args
             self.variants: list[KernelVariant] = [
                 KernelVariant(
                     config=fast_config,
                     suffix="_div16",
                     triton_meta={**triton_meta, "configs": [fast_config]},
                 ),
-                # General fallback: only statically-proven divisibility, always safe
                 KernelVariant(
                     config=base_config,
                     suffix="_general",
@@ -5651,7 +5644,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         else:
             # No speculation — single kernel, existing path
             triton_meta["configs"] = [config_of(signature)]
-            self.speculative_hints = []
+            self._variant_check_args = []
             self.variants = []
 
         # Triton compiler includes equal_to_1 args into constants even
@@ -5859,7 +5852,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.variants:
             runtime_condition = self._build_runtime_condition(
-                self.speculative_hints, call_args
+                self._variant_check_args, call_args
             )
             wrapper.generate_kernel_call(
                 name,
@@ -5886,50 +5879,33 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _build_runtime_condition(
         self,
-        hints: list[SpeculativeHint],
+        check_args: list[tuple[int, sympy.Expr]],
         call_args: list[Any],
     ) -> str | None:
-        """Build a deduplicated runtime condition string for variant dispatch.
+        """Build a single bitwise OR runtime condition for variant dispatch.
 
-        Resolves each hint's sympy_expr to the call-site variable name and formats
-        a check expression. Deduplicates by sympy_expr identity — multiple SizeArgs
-        at different signature positions can share the same symbol (e.g. ks0 and
-        r0_numel both mapping to s1), and we only need one runtime check per symbol.
-
-        Uses bitwise OR to combine multiple divisibility checks into a single
-        modulo: (a | b) % 16 == 0 iff a % 16 == 0 and b % 16 == 0, since
-        the low bits of the OR are zero only when both operands' low bits are zero.
-
-        Returns e.g. "(s0 | s1) % 16 == 0", or None if no conditions.
+        Deduplicates by sympy expression (multiple SizeArgs can share the same
+        symbol). Combines checks into (a | b | c) % 16 == 0 instead of
+        a % 16 == 0 and b % 16 == 0 and c % 16 == 0.
         """
         seen_exprs: set[sympy.Expr] = set()
-        # Group call-site variables by (check_type, check_value)
-        groups: dict[tuple[HintCheckType, int], list[str]] = {}
-        for hint in hints:
-            if hint.sympy_expr in seen_exprs:
+        check_vars: list[str] = []
+        for arg_index, sympy_expr in check_args:
+            if sympy_expr in seen_exprs:
                 continue
-            seen_exprs.add(hint.sympy_expr)
-
-            # Resolve to the call-site variable name (e.g. "s0" not "ks0")
+            seen_exprs.add(sympy_expr)
             call_var = (
-                call_args[hint.arg_index]
-                if hint.arg_index < len(call_args)
-                else hint.arg_name  # fallback to kernel arg name
+                call_args[arg_index]
+                if arg_index < len(call_args)
+                else str(sympy_expr)
             )
-            key = (hint.check_type, hint.check_value)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(str(call_var))
+            check_vars.append(str(call_var))
 
-        conditions: list[str] = []
-        for (check_type, check_value), vars in groups.items():
-            if check_type == HintCheckType.DIVISIBLE:
-                if len(vars) == 1:
-                    conditions.append(f"{vars[0]} % {check_value} == 0")
-                else:
-                    or_expr = " | ".join(vars)
-                    conditions.append(f"({or_expr}) % {check_value} == 0")
-        return " and ".join(conditions) if conditions else None
+        if not check_vars:
+            return None
+        if len(check_vars) == 1:
+            return f"{check_vars[0]} % 16 == 0"
+        return f"({' | '.join(check_vars)}) % 16 == 0"
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code
