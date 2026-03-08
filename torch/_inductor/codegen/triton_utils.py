@@ -291,14 +291,7 @@ def speculative_hints(
     if not config.triton.speculative_divisibility:
         return []
 
-    if hasattr(base_config, "divisible_by_16"):
-        proven_div16 = base_config.divisible_by_16
-    elif hasattr(base_config, "divisibility_16"):
-        proven_div16 = base_config.divisibility_16
-    else:
-        proven_div16 = ()
-
-    proven_set = set(proven_div16)
+    proven_set = set(base_config.divisible_by_16)
     hints: list[SpeculativeHint] = []
 
     for i, arg in zip(indices, args):
@@ -336,20 +329,5 @@ def apply_hints(
 ) -> Any:
     """Create a new config with speculative hints applied on top of base."""
     extra_div16 = tuple(h.arg_index for h in hints if h.check_type == HintCheckType.DIVISIBLE)
-    # Extract existing divisible_by_16 from base_config
-    if hasattr(base_config, "divisible_by_16"):
-        existing = base_config.divisible_by_16
-    elif hasattr(base_config, "divisibility_16"):
-        existing = base_config.divisibility_16
-    elif isinstance(base_config, dict):
-        existing = tuple(k[0] for k in base_config if isinstance(k, tuple))
-    else:
-        existing = ()
-    new_div16 = tuple(sorted(set(existing) | set(extra_div16)))
-
-    if hasattr(base_config, "equal_to_1"):
-        equal_to_1 = base_config.equal_to_1
-    else:
-        equal_to_1 = ()
-
-    return AttrsDescriptorWrapper(new_div16, equal_to_1)
+    new_div16 = tuple(sorted(set(base_config.divisible_by_16) | set(extra_div16)))
+    return AttrsDescriptorWrapper(new_div16, base_config.equal_to_1)
