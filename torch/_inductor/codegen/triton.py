@@ -5896,10 +5896,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         at different signature positions can share the same symbol (e.g. ks0 and
         r0_numel both mapping to s1), and we only need one runtime check per symbol.
 
-        Returns e.g. "s0 % 16 == 0 and s1 % 16 == 0", or None if no conditions.
+        Uses bitwise OR to combine multiple divisibility checks into a single
+        modulo: (a | b) % 16 == 0 iff a % 16 == 0 and b % 16 == 0, since
+        the low bits of the OR are zero only when both operands' low bits are zero.
+
+        Returns e.g. "(s0 | s1) % 16 == 0", or None if no conditions.
         """
         seen_exprs: set[sympy.Expr] = set()
-        conditions: list[str] = []
+        # Group call-site variables by (check_type, check_value)
+        groups: dict[tuple[HintCheckType, int], list[str]] = {}
         for hint in hints:
             if hint.sympy_expr in seen_exprs:
                 continue
@@ -5911,8 +5916,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 if hint.arg_index < len(call_args)
                 else hint.arg_name  # fallback to kernel arg name
             )
-            if hint.check_type == HintCheckType.DIVISIBLE:
-                conditions.append(f"{call_var} % {hint.check_value} == 0")
+            key = (hint.check_type, hint.check_value)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(str(call_var))
+
+        conditions: list[str] = []
+        for (check_type, check_value), vars in groups.items():
+            if check_type == HintCheckType.DIVISIBLE:
+                if len(vars) == 1:
+                    conditions.append(f"{vars[0]} % {check_value} == 0")
+                else:
+                    or_expr = " | ".join(vars)
+                    conditions.append(f"({or_expr}) % {check_value} == 0")
         return " and ".join(conditions) if conditions else None
 
     def codegen_nan_check(self) -> None:
