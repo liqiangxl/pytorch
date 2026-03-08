@@ -232,7 +232,7 @@ def config_of(
     args: list[KernelArgType],
     *,
     indices: list[int] | None = None,
-) -> tuple[Any, list[SpeculativeHint]]:
+) -> Any:
     if indices is None:
         indices = list(range(len(args)))
 
@@ -279,19 +279,24 @@ def config_of(
     equal_to_1 = equal_1_arg_indices(args, indices=indices)
 
     # pyrefly: ignore [bad-argument-type]
-    base_config = AttrsDescriptorWrapper(divisible_by_16, equal_to_1)
-    speculative_hints = _discover_speculative_hints(args, indices, divisible_by_16)
-    return base_config, speculative_hints
+    return AttrsDescriptorWrapper(divisible_by_16, equal_to_1)
 
 
-def _discover_speculative_hints(
+def speculative_hints(
     args: list[KernelArgType],
     indices: list[int],
-    proven_div16: tuple[int, ...],
+    base_config: Any,
 ) -> list[SpeculativeHint]:
     """Scan SizeArgs for hint-based divisibility that isn't statically provable."""
     if not config.triton.speculative_divisibility:
         return []
+
+    if hasattr(base_config, "divisible_by_16"):
+        proven_div16 = base_config.divisible_by_16
+    elif hasattr(base_config, "divisibility_16"):
+        proven_div16 = base_config.divisibility_16
+    else:
+        proven_div16 = ()
 
     proven_set = set(proven_div16)
     hints: list[SpeculativeHint] = []

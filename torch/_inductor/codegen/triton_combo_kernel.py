@@ -731,7 +731,7 @@ class ComboKernel(Kernel):
             triton_meta["constants"][signature[arg_num].name] = 1  # type: ignore[index,union-attr]
 
         # pyrefly: ignore [bad-typed-dict-key, unsupported-operation]
-        triton_meta["configs"] = [config_of(signature)[0]]
+        triton_meta["configs"] = [config_of(signature)]
 
         if TritonKernel._enable_pdl_codegen():
             # pyrefly: ignore [bad-typed-dict-key, unsupported-operation]

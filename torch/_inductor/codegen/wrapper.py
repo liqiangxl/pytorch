@@ -2840,7 +2840,7 @@ class PythonWrapperCodegen(CodeGen):
                 config_of(
                     signature,
                     indices=arg_indices,
-                )[0]
+                )
             ],
         }
 

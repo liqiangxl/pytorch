@@ -114,6 +114,7 @@ from .triton_utils import (
     non_constexpr_signature,
     should_unwrap_unspec_arg,
     signature_to_meta,
+    speculative_hints,
     SpeculativeHint,
 )
 from .wrapper import SymbolicCallArg
@@ -5610,12 +5611,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if flops is not None:
                 inductor_meta["kernel_flop"] = flops
 
-        base_config, speculative_hints = config_of(signature)
+        base_config = config_of(signature)
+        hints = speculative_hints(signature, list(range(len(signature))), base_config)
 
-        if speculative_hints and not V.graph.cpp_wrapper:
-            fast_config = apply_hints(base_config, speculative_hints)
+        if hints and not V.graph.cpp_wrapper:
+            fast_config = apply_hints(base_config, hints)
             triton_meta["configs"] = [fast_config]
-            self.speculative_hints = speculative_hints
+            self.speculative_hints = hints
             self.variants: list[KernelVariant] = [
                 KernelVariant(
                     config=fast_config,

@@ -673,7 +673,7 @@ class TritonTemplateKernel(TritonKernel):
             "device": DeviceProperties.create(self.output_node.get_device()),
             "constants": {},
         }
-        triton_meta["configs"] = [config_of(signature)[0]]
+        triton_meta["configs"] = [config_of(signature)]
         for arg_num in equal_1_arg_indices(signature):  # type: ignore[index]
             triton_meta["constants"][signature[arg_num].name] = 1  # type: ignore[index,union-attr]
         matrix_instr_nonkdim = self.meta.get("matrix_instr_nonkdim", None)
