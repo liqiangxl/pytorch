@@ -107,11 +107,14 @@ from .simd import (
     SIMDScheduling,
 )
 from .triton_utils import (
+    apply_hints,
     config_of,
     equal_1_arg_indices,
+    HintCheckType,
     non_constexpr_signature,
     should_unwrap_unspec_arg,
     signature_to_meta,
+    SpeculativeHint,
 )
 from .wrapper import SymbolicCallArg
 
@@ -133,6 +136,14 @@ perf_hint_log = torch._logging.getArtifactLogger(__name__, "perf_hints")
 schedule_log = torch._logging.getArtifactLogger(__name__, "schedule")
 fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
 async_compile = AsyncCompile()
+
+
+@dataclasses.dataclass
+class KernelVariant:
+    config: Any  # AttrsDescriptorWrapper
+    suffix: str  # "_div16" or "_general"
+    triton_meta: dict  # full triton_meta for this variant
+    src_code: str = ""  # filled after codegen
 
 # Threshold for detecting inner reductions based on tiling score ratio.
 # If r0_tiling_score / x_tiling_score >= this value, upgrade DEFAULT hint to INNER.
@@ -5599,7 +5610,28 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if flops is not None:
                 inductor_meta["kernel_flop"] = flops
 
-        triton_meta["configs"] = [config_of(signature)]
+        base_config, speculative_hints = config_of(signature)
+
+        if speculative_hints and not V.graph.cpp_wrapper:
+            fast_config = apply_hints(base_config, speculative_hints)
+            triton_meta["configs"] = [fast_config]
+            self.speculative_hints = speculative_hints
+            self.variants: list[KernelVariant] = [
+                KernelVariant(
+                    config=fast_config,
+                    suffix="_div16",
+                    triton_meta={**triton_meta, "configs": [fast_config]},
+                ),
+                KernelVariant(
+                    config=base_config,
+                    suffix="_general",
+                    triton_meta={**triton_meta, "configs": [base_config]},
+                ),
+            ]
+        else:
+            triton_meta["configs"] = [base_config]
+            self.speculative_hints = []
+            self.variants = []
 
         # Triton compiler includes equal_to_1 args into constants even
         # when they are not constexpr. otherwise there may be a segfault
@@ -5679,7 +5711,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if config.benchmark_kernel:
             code.splice(self.codegen_kernel_benchmark(num_gb))
 
-        return code.getvalue()
+        src_code = code.getvalue()
+
+        # Fill variant src_code by replacing triton_meta repr in the source
+        if self.variants:
+            fast_meta_repr = repr(self.variants[0].triton_meta)
+            for variant in self.variants:
+                variant_meta_repr = repr(variant.triton_meta)
+                variant.src_code = src_code.replace(fast_meta_repr, variant_meta_repr)
+
+        return src_code
 
     @staticmethod
     def _get_persistent_RBLOCK(rnumel):
@@ -5791,17 +5832,54 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         for ws in self.args.workspace_args:
             wrapper.generate_workspace_allocation(ws)
 
-        wrapper.generate_kernel_call(
-            name,
-            call_args,
-            triton=True,
-            arg_types=arg_types,
-            triton_meta=self.triton_meta,
-            inductor_meta=self.inductor_meta,
-        )
+        if self.variants:
+            runtime_condition = self._build_runtime_condition(
+                self.speculative_hints, call_args
+            )
+            wrapper.generate_kernel_call(
+                name,
+                call_args,
+                triton=True,
+                arg_types=arg_types,
+                triton_meta=self.triton_meta,
+                inductor_meta=self.inductor_meta,
+                variants=self.variants,
+                runtime_condition=runtime_condition,
+            )
+        else:
+            wrapper.generate_kernel_call(
+                name,
+                call_args,
+                triton=True,
+                arg_types=arg_types,
+                triton_meta=self.triton_meta,
+                inductor_meta=self.inductor_meta,
+            )
 
         if deallocate_ws:
             self.deallocate_workspaces()
+
+    def _build_runtime_condition(
+        self,
+        hints: list[SpeculativeHint],
+        call_args: list[Any],
+    ) -> str | None:
+        """Build deduplicated runtime check from speculative hints resolved to call-site names."""
+        seen_exprs: set[sympy.Expr] = set()
+        conditions: list[str] = []
+        for hint in hints:
+            expr_key = hint.sympy_expr
+            if expr_key in seen_exprs:
+                continue
+            seen_exprs.add(expr_key)
+            call_expr = (
+                call_args[hint.arg_index]
+                if hint.arg_index < len(call_args)
+                else hint.arg_name
+            )
+            if hint.check_type == HintCheckType.DIVISIBLE:
+                conditions.append(f"{call_expr} % {hint.check_value} == 0")
+        return " and ".join(conditions) if conditions else None
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code
@@ -6320,36 +6398,70 @@ class TritonScheduling(SIMDScheduling):
 
             # use the original src_code as the key
             wrapper.src_to_kernel[src_code] = kernel_name
-            subs_name = kernel_name if config.triton.unique_kernel_names else "triton_"
 
-            # DESCRIPTIVE_NAME is used for profiling purposes; it shows the full kernel name
-            # even when unique_kernel_names is turned off. Meanwhile, KERNEL_NAME is sometimes set
-            # to "triton_" to maximize caching opportunities (when unique_kernel_names = False).
-            src_code = src_code.replace(str(Placeholder.DESCRIPTIVE_NAME), kernel_name)
-            src_code = src_code.replace(str(Placeholder.KERNEL_NAME), subs_name)
-
-            # TODO(voz): Ostensibly, we should not need this. But there are cases where C++ codegen does
-            # not use BracesBuffer, so we have no good indicator of a C++ buffer atm.
-            src_code = src_code.replace("#pragma CMT", "#")
-
-            _basename, _, kernel_path = get_path(code_hash(src_code.strip()), "py")
-
-            self._emit_kernel_to_wrapper(
-                wrapper,
-                kernel,
-                src_code,
-                kernel_name,
-                subs_name,
-                node_schedule,
-                kernel_path,
-                get_kernel_metadata,
-            )
+            if getattr(kernel, "variants", None):
+                # Multi-variant path: emit each variant as a separate kernel
+                for variant in kernel.variants:
+                    variant_name = kernel_name + variant.suffix
+                    variant_src = variant.src_code
+                    variant_src = variant_src.replace(
+                        str(Placeholder.DESCRIPTIVE_NAME), variant_name
+                    )
+                    variant_subs = (
+                        variant_name
+                        if config.triton.unique_kernel_names
+                        else "triton_"
+                    )
+                    variant_src = variant_src.replace(
+                        str(Placeholder.KERNEL_NAME), variant_subs
+                    )
+                    variant_src = variant_src.replace("#pragma CMT", "#")
+                    _basename, _, variant_path = get_path(
+                        code_hash(variant_src.strip()), "py"
+                    )
+                    self._emit_kernel_to_wrapper(
+                        wrapper,
+                        kernel,
+                        variant_src,
+                        variant_name,
+                        variant_subs,
+                        node_schedule,
+                        variant_path,
+                        get_kernel_metadata,
+                    )
+            else:
+                # Single-kernel path (original)
+                subs_name = (
+                    kernel_name
+                    if config.triton.unique_kernel_names
+                    else "triton_"
+                )
+                src_code = src_code.replace(
+                    str(Placeholder.DESCRIPTIVE_NAME), kernel_name
+                )
+                src_code = src_code.replace(
+                    str(Placeholder.KERNEL_NAME), subs_name
+                )
+                src_code = src_code.replace("#pragma CMT", "#")
+                _basename, _, kernel_path = get_path(
+                    code_hash(src_code.strip()), "py"
+                )
+                self._emit_kernel_to_wrapper(
+                    wrapper,
+                    kernel,
+                    src_code,
+                    kernel_name,
+                    subs_name,
+                    node_schedule,
+                    kernel_path,
+                    get_kernel_metadata,
+                )
 
             # log kernel metadata for offline analysis.
             # E.g. one can find all unaligned inner reduction and check if
             # padding helps with the perf kernel by kernel.
             if metrics.is_metric_table_enabled("kernel_metadata"):
-                metrics.log_kernel_metadata(kernel_name, kernel_path, src_code)
+                metrics.log_kernel_metadata(kernel_name, kernel_path if not getattr(kernel, "variants", None) else "", src_code)
 
         return kernel_name
 

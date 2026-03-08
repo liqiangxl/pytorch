@@ -80,7 +80,7 @@ class TestCodegenTriton(InductorTestCase):
                     SizeArg("D", s0),  # no
                     SizeArg("E", s1),  # no
                 ]
-            ),
+            )[0],
         )
 
         _check_divisibility(
@@ -95,8 +95,107 @@ class TestCodegenTriton(InductorTestCase):
                     SizeArg("F", sixteen * eight * s0 * s1),  # 5: yes
                     SizeArg("G", two * eight * s0 * s1),  # 6: yes
                 ]
-            ),
+            )[0],
         )
+
+    @inductor_config.patch(
+        {"triton.divisible_by_16": True, "triton.speculative_divisibility": True}
+    )
+    def test_apply_hints(self):
+        from torch._inductor.codegen.triton_utils import (
+            apply_hints,
+            HintCheckType,
+            SpeculativeHint,
+        )
+        from torch._inductor.runtime.hints import AttrsDescriptorWrapper
+        from torch._inductor.utils import (
+            get_triton_attrs_descriptor_version,
+            TritonAttrsDescriptorVersion,
+        )
+
+        s0 = sympy.Symbol("s0", positive=True, integer=True)
+        base_config = AttrsDescriptorWrapper((0, 1), ())
+        hints = [
+            SpeculativeHint(
+                arg_index=3,
+                arg_name="ks0",
+                check_type=HintCheckType.DIVISIBLE,
+                check_value=16,
+                sympy_expr=s0,
+            ),
+            SpeculativeHint(
+                arg_index=5,
+                arg_name="xnumel",
+                check_type=HintCheckType.DIVISIBLE,
+                check_value=16,
+                sympy_expr=s0,
+            ),
+        ]
+        result = apply_hints(base_config, hints)
+
+        version = get_triton_attrs_descriptor_version()
+        if version in {
+            TritonAttrsDescriptorVersion.V1_COMPILER,
+            TritonAttrsDescriptorVersion.V0_NO_TRITON,
+        }:
+            self.assertEqual((0, 1, 3, 5), result.divisible_by_16)
+        elif version in {
+            TritonAttrsDescriptorVersion.V2_BACKENDS,
+            TritonAttrsDescriptorVersion.V3_BACKENDS_TUPLE,
+        }:
+            self.assertEqual((0, 1, 3, 5), result.divisibility_16)
+        elif version == TritonAttrsDescriptorVersion.V4_DICT:
+            for idx in (0, 1, 3, 5):
+                self.assertIn((idx,), result)
+
+    @inductor_config.patch(
+        {"triton.divisible_by_16": True, "triton.speculative_divisibility": True}
+    )
+    def test_speculative_variant_dispatch(self):
+        if not HAS_GPU:
+            self.skipTest("requires GPU")
+
+        from torch._inductor.utils import run_and_get_code
+
+        @torch.compile(dynamic=True)
+        def f(x):
+            return x * 2
+
+        x = torch.randn(1024, device="cuda")
+        result, code = run_and_get_code(f, x)
+
+        # Two kernel variants emitted
+        self.assertTrue(any("_div16" in c for c in code))
+        self.assertTrue(any("_general" in c for c in code))
+
+        # Runtime dispatch condition
+        self.assertTrue(any("% 16 == 0" in c for c in code))
+
+        # Correctness
+        self.assertTrue(torch.allclose(result, x * 2))
+
+    @inductor_config.patch(
+        {"triton.divisible_by_16": True, "triton.speculative_divisibility": False}
+    )
+    def test_no_variants_when_disabled(self):
+        if not HAS_GPU:
+            self.skipTest("requires GPU")
+
+        from torch._inductor.utils import run_and_get_code
+
+        @torch.compile(dynamic=True)
+        def f(x):
+            return x * 2
+
+        x = torch.randn(1024, device="cuda")
+        result, code = run_and_get_code(f, x)
+
+        # No variants when feature is disabled
+        self.assertFalse(any("_div16" in c for c in code))
+        self.assertFalse(any("_general" in c for c in code))
+
+        # Still correct
+        self.assertTrue(torch.allclose(result, x * 2))
 
 
 if __name__ == "__main__":

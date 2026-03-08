@@ -1710,6 +1710,12 @@ class triton:
     # hint to Triton when arguments are divisible by 16
     divisible_by_16 = os.environ.get("TORCHINDUCTOR_DIVISIBLE_BY_16", "1") == "1"
 
+    # AOT-compile fast (div16) + general kernel variants with runtime dispatch
+    # for SizeArgs whose concrete hint is divisible by 16 but not statically provable.
+    speculative_divisibility = (
+        os.environ.get("TORCHINDUCTOR_SPECULATIVE_DIVISIBILITY", "0") == "1"
+    )
+
     # Minimum R0_BLOCK to be used for a TritonSplitScanKernel
     # NOTE: This also indirectly controls the size of workspace buffer required
     min_split_scan_rblock = 256

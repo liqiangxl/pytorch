@@ -697,6 +697,30 @@ class KernelCallLine(WrapperLine):
 
 
 @dataclasses.dataclass
+class VariantKernelCallLine(WrapperLine):
+    """Emits runtime if/elif/else dispatch between N kernel variants."""
+
+    wrapper: PythonWrapperCodegen
+    kernel_name: str
+    call_args: tuple[Any, ...]
+    arg_types: list[str]
+    variants: list[Any]  # list[KernelVariant]
+    runtime_condition: str
+    device: torch.device
+    graph_name: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        self.wrapper._generate_variant_kernel_call_helper(
+            self.kernel_name,
+            self.call_args,
+            self.variants,
+            self.runtime_condition,
+            self.device,
+            self.graph_name,
+        )
+
+
+@dataclasses.dataclass
 class KernelDefinitionLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     kernel_name: str
@@ -2816,7 +2840,7 @@ class PythonWrapperCodegen(CodeGen):
                 config_of(
                     signature,
                     indices=arg_indices,
-                )
+                )[0]
             ],
         }
 
@@ -3170,6 +3194,8 @@ class PythonWrapperCodegen(CodeGen):
         triton_meta=None,
         inductor_meta=None,
         original_fxnode_name=None,
+        variants=None,
+        runtime_condition=None,
     ):
         """
         Generates kernel call code.
@@ -3189,27 +3215,42 @@ class PythonWrapperCodegen(CodeGen):
         )
 
         device = device or V.graph.get_current_device_or_throw()
-        self.writeline(
-            KernelCallLine(
-                self,
-                kernel_name=kernel_name,
-                call_args=call_args,
-                # pyrefly: ignore [bad-argument-type]
-                raw_keys=raw_keys,
-                # pyrefly: ignore [bad-argument-type]
-                raw_args=raw_args,
-                # pyrefly: ignore [bad-argument-type]
-                arg_types=arg_types,
-                triton=triton,
-                # pyrefly: ignore [bad-argument-type]
-                triton_meta=triton_meta,
-                inductor_meta=inductor_meta,
-                device=device,
-                graph_name=V.graph.name,
-                # pyrefly: ignore [bad-argument-type]
-                original_fxnode_name=original_fxnode_name,
+
+        if variants and runtime_condition:
+            self.writeline(
+                VariantKernelCallLine(
+                    self,
+                    kernel_name=kernel_name,
+                    call_args=call_args,
+                    arg_types=arg_types or [],
+                    variants=variants,
+                    runtime_condition=runtime_condition,
+                    device=device,
+                    graph_name=V.graph.name,
+                )
             )
-        )
+        else:
+            self.writeline(
+                KernelCallLine(
+                    self,
+                    kernel_name=kernel_name,
+                    call_args=call_args,
+                    # pyrefly: ignore [bad-argument-type]
+                    raw_keys=raw_keys,
+                    # pyrefly: ignore [bad-argument-type]
+                    raw_args=raw_args,
+                    # pyrefly: ignore [bad-argument-type]
+                    arg_types=arg_types,
+                    triton=triton,
+                    # pyrefly: ignore [bad-argument-type]
+                    triton_meta=triton_meta,
+                    inductor_meta=inductor_meta,
+                    device=device,
+                    graph_name=V.graph.name,
+                    # pyrefly: ignore [bad-argument-type]
+                    original_fxnode_name=original_fxnode_name,
+                )
+            )
 
     def _generate_kernel_call_helper(
         self,
@@ -3397,6 +3438,38 @@ class PythonWrapperCodegen(CodeGen):
         with debug_printer_manager:
             self.writeline(f"{kernel_name}.run({call_args_str}, stream={stream_name})")
         self.write_triton_header_once()
+
+    def _generate_variant_kernel_call_helper(
+        self,
+        kernel_name: str,
+        call_args,
+        variants,
+        runtime_condition: str,
+        device=None,
+        graph_name="",
+    ):
+        """Emit if/else dispatch between N kernel variants."""
+        device = device or V.graph.get_current_device_or_throw()
+        call_args_str = ", ".join(self.prepare_triton_kernel_call(call_args))
+        stream_name = PythonWrapperCodegen.write_get_raw_stream(
+            self, device.index, graph_name
+        )
+        self.write_triton_header_once()
+
+        for i, variant in enumerate(variants):
+            suffixed_name = kernel_name + variant.suffix
+            call_line = f"{suffixed_name}.run({call_args_str}, stream={stream_name})"
+
+            if i == 0 and runtime_condition:
+                self.writeline(f"if {runtime_condition}:")
+                self.writeline(f"    {call_line}")
+            elif i == len(variants) - 1:
+                self.writeline("else:")
+                self.writeline(f"    {call_line}")
+            else:
+                # Intermediate variants (for N>2 strategies)
+                self.writeline(f"elif {getattr(variant, 'condition', 'True')}:")
+                self.writeline(f"    {call_line}")
 
     def writeline(self, line):
         self.lines.append(line)

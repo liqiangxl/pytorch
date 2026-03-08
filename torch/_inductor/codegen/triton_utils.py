@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+import dataclasses
+import enum
 from typing import Any
 
 import sympy
@@ -19,6 +21,19 @@ from .common import (
     TMADescriptorArg,
     WorkspaceArg,
 )
+
+
+class HintCheckType(enum.Enum):
+    DIVISIBLE = "divisible"
+
+
+@dataclasses.dataclass(frozen=True)
+class SpeculativeHint:
+    arg_index: int
+    arg_name: str
+    check_type: HintCheckType
+    check_value: int
+    sympy_expr: sympy.Expr
 
 
 def should_unwrap_unspec_arg(name: str):
@@ -217,7 +232,7 @@ def config_of(
     args: list[KernelArgType],
     *,
     indices: list[int] | None = None,
-) -> Any:
+) -> tuple[Any, list[SpeculativeHint]]:
     if indices is None:
         indices = list(range(len(args)))
 
@@ -264,4 +279,72 @@ def config_of(
     equal_to_1 = equal_1_arg_indices(args, indices=indices)
 
     # pyrefly: ignore [bad-argument-type]
-    return AttrsDescriptorWrapper(divisible_by_16, equal_to_1)
+    base_config = AttrsDescriptorWrapper(divisible_by_16, equal_to_1)
+    speculative_hints = _discover_speculative_hints(args, indices, divisible_by_16)
+    return base_config, speculative_hints
+
+
+def _discover_speculative_hints(
+    args: list[KernelArgType],
+    indices: list[int],
+    proven_div16: tuple[int, ...],
+) -> list[SpeculativeHint]:
+    """Scan SizeArgs for hint-based divisibility that isn't statically provable."""
+    if not config.triton.speculative_divisibility:
+        return []
+
+    proven_set = set(proven_div16)
+    hints: list[SpeculativeHint] = []
+
+    for i, arg in zip(indices, args):
+        if i in proven_set:
+            continue
+        if not isinstance(arg, SizeArg):
+            continue
+        if arg.expr is None or isinstance(arg.expr, float):
+            continue
+        if arg.name.startswith("load_seed_offset"):
+            continue
+
+        try:
+            concrete_hint = V.graph.sizevars.shape_env.size_hint(arg.expr, allow_none=True)
+        except Exception:
+            continue
+
+        if concrete_hint is not None and concrete_hint % 16 == 0:
+            hints.append(
+                SpeculativeHint(
+                    arg_index=i,
+                    arg_name=arg.name,
+                    check_type=HintCheckType.DIVISIBLE,
+                    check_value=16,
+                    sympy_expr=arg.expr,
+                )
+            )
+
+    return hints
+
+
+def apply_hints(
+    base_config: Any,
+    hints: list[SpeculativeHint],
+) -> Any:
+    """Create a new config with speculative hints applied on top of base."""
+    extra_div16 = tuple(h.arg_index for h in hints if h.check_type == HintCheckType.DIVISIBLE)
+    # Extract existing divisible_by_16 from base_config
+    if hasattr(base_config, "divisible_by_16"):
+        existing = base_config.divisible_by_16
+    elif hasattr(base_config, "divisibility_16"):
+        existing = base_config.divisibility_16
+    elif isinstance(base_config, dict):
+        existing = tuple(k[0] for k in base_config if isinstance(k, tuple))
+    else:
+        existing = ()
+    new_div16 = tuple(sorted(set(existing) | set(extra_div16)))
+
+    if hasattr(base_config, "equal_to_1"):
+        equal_to_1 = base_config.equal_to_1
+    else:
+        equal_to_1 = ()
+
+    return AttrsDescriptorWrapper(new_div16, equal_to_1)
