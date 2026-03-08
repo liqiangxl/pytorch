@@ -24,11 +24,31 @@ from .common import (
 
 
 class HintCheckType(enum.Enum):
-    DIVISIBLE = "divisible"
+    """Type of runtime check for a speculative hint."""
+
+    DIVISIBLE = "divisible"  # arg % value == 0
 
 
 @dataclasses.dataclass(frozen=True)
 class SpeculativeHint:
+    """A speculative divisibility annotation for a kernel SizeArg.
+
+    When dynamic=True, SizeArgs may not be statically provable as divisible by 16,
+    preventing Triton from emitting vectorized loads (LDG.E.128). A SpeculativeHint
+    records that a SizeArg *could* be divisible, enabling AOT compilation of a fast
+    variant with the divisibility annotation applied.
+
+    Fields:
+        arg_index:  Position in the kernel's flattened signature (used by apply_hints
+                    to add to the divisible_by_16 tuple for Triton config).
+        arg_name:   SizeArg.name (e.g. "ks0", "xnumel") — for debugging only.
+        check_type: What runtime check to emit (currently only DIVISIBLE).
+        check_value: The divisor (16 for Triton's tt.divisibility=16).
+        sympy_expr: The symbolic expression from SizeArg.expr — used to deduplicate
+                    runtime conditions when multiple SizeArgs share the same symbol
+                    (e.g. ks0 and r0_numel both mapping to s1).
+    """
+
     arg_index: int
     arg_name: str
     check_type: HintCheckType
@@ -228,6 +248,60 @@ def equal_1_arg_indices(
     return equal_to_1
 
 
+def _is_aligned(x: KernelArgType, alignment: int, include_tensor: bool) -> bool:
+    """Check if a kernel arg is statically provable as aligned to `alignment` bytes.
+
+    For TensorArgs: checks pointer offset alignment and buffer alignment.
+    For SizeArgs: checks if the symbolic expression is a known multiple of `alignment`.
+    For WorkspaceArgs: always aligned (we control the allocation).
+
+    Mirrors Triton's alignment logic:
+    https://github.com/triton-lang/triton/blob/5282ed890d453e10b9ee30076ef89115dd197761/python/triton/runtime/jit.py#L208-L222
+    """
+    if isinstance(x, TensorArg):
+        if include_tensor:
+            offset_aligned = V.graph.sizevars.statically_known_multiple_of(
+                x.offset * x.dtype.itemsize,
+                alignment,  # type: ignore[arg-type]
+            )
+            return offset_aligned and not is_unaligned_buffer(x)
+        else:
+            return False
+    if isinstance(x, SizeArg):
+        # TODO(voz): These are kinda redundant, if we can solve out statically_known_multiple_of with
+        # _maybe_evaluate_static...
+        if x.name.startswith("load_seed_offset"):
+            return False
+        if x.expr is None:
+            return False
+        if isinstance(x.expr, float):
+            return False
+        return V.graph.sizevars.statically_known_multiple_of(x.expr, alignment)  # type: ignore[arg-type]
+    if isinstance(x, WorkspaceArg):
+        # We allocate the workspace ourselves, so it is always aligned
+        return True
+    if isinstance(x, (TMADescriptorArg, ConstexprArg)):
+        return False
+    raise NotImplementedError(f"unhandled {type(x)}: {x}")
+
+
+def divisible_by_16_indices(
+    args: list[KernelArgType],
+    *,
+    indices: list[int] | None = None,
+) -> tuple[int, ...]:
+    """Compute which arg indices are statically provable as divisible by 16."""
+    if not config.triton.divisible_by_16:
+        return ()
+    if indices is None:
+        indices = list(range(len(args)))
+    return tuple(
+        i
+        for i, arg in zip(indices, args)
+        if _is_aligned(arg, alignment=16, include_tensor=True)
+    )
+
+
 def config_of(
     args: list[KernelArgType],
     *,
@@ -236,66 +310,58 @@ def config_of(
     if indices is None:
         indices = list(range(len(args)))
 
-    def is_aligned(x: KernelArgType, alignment: int, include_tensor: bool) -> bool:
-        """
-        Roughly follow triton code here:
-        https://github.com/triton-lang/triton/blob/5282ed890d453e10b9ee30076ef89115dd197761/python/triton/runtime/jit.py#L208-L222
-        """
-        if isinstance(x, TensorArg):
-            if include_tensor:
-                offset_aligned = V.graph.sizevars.statically_known_multiple_of(
-                    x.offset * x.dtype.itemsize,
-                    alignment,  # type: ignore[arg-type]
-                )
-                return offset_aligned and not is_unaligned_buffer(x)
-            else:
-                return False
-        if isinstance(x, SizeArg):
-            # TODO(voz): These are kinda redundant, if we can solve out statically_known_multiple_of with
-            # _maybe_evaluate_static...
-            if x.name.startswith("load_seed_offset"):
-                return False
-            if x.expr is None:
-                return False
-            if isinstance(x.expr, float):
-                return False
-            return V.graph.sizevars.statically_known_multiple_of(x.expr, alignment)  # type: ignore[arg-type]
-        if isinstance(x, WorkspaceArg):
-            # We allocate the workspace ourselves, so it is always aligned
-            return True
-        if isinstance(x, (TMADescriptorArg, ConstexprArg)):
-            return False
-        raise NotImplementedError(f"unhandled {type(x)}: {x}")
-
-    if config.triton.divisible_by_16:
-        divisible_by_16 = tuple(
-            i
-            for i, arg in zip(indices, args)
-            if is_aligned(arg, alignment=16, include_tensor=True)
-        )
-    else:
-        divisible_by_16 = ()
-
+    divisible_by_16 = divisible_by_16_indices(args, indices=indices)
     equal_to_1 = equal_1_arg_indices(args, indices=indices)
 
     # pyrefly: ignore [bad-argument-type]
     return AttrsDescriptorWrapper(divisible_by_16, equal_to_1)
 
 
+def _get_divisible_by_16(attrs_config: Any) -> set[int]:
+    """Extract divisible-by-16 arg indices from an AttrsDescriptorWrapper.
+
+    AttrsDescriptorWrapper has different formats across Triton versions:
+      - V0 (no triton) / V1 (triton.compiler): namedtuple with .divisible_by_16
+      - V2/V3 (triton.backends): AttrsDescriptor with .divisibility_16
+      - V4 (2025 dict): {(idx,): [["tt.divisibility", 16]], ...}
+    """
+    if hasattr(attrs_config, "divisible_by_16"):
+        return set(attrs_config.divisible_by_16)
+    if hasattr(attrs_config, "divisibility_16"):
+        return set(attrs_config.divisibility_16)
+    if isinstance(attrs_config, dict):
+        return {k[0] for k in attrs_config if isinstance(k, tuple)}
+    return set()
+
+
 def speculative_hints(
     args: list[KernelArgType],
-    indices: list[int],
     base_config: Any,
+    *,
+    indices: list[int] | None = None,
 ) -> list[SpeculativeHint]:
-    """Scan SizeArgs for hint-based divisibility that isn't statically provable."""
+    """Find SizeArgs that could benefit from speculative divisibility-by-16 annotation.
+
+    Returns a SpeculativeHint for each symbolic SizeArg whose divisibility by 16
+    is not statically provable. These hints are used to AOT-compile a fast kernel
+    variant (with tt.divisibility=16 applied) alongside a general fallback, with
+    runtime if/else dispatch based on the actual values.
+
+    This is a companion to config_of() — config_of() computes what is statically
+    proven, speculative_hints() identifies what could additionally be true at runtime.
+    """
     if not config.triton.speculative_divisibility:
         return []
 
-    proven_set = set(base_config.divisible_by_16)
+    if indices is None:
+        indices = list(range(len(args)))
+
+    # Indices already statically proven divisible by 16 — no need to speculate
+    proven_div16 = _get_divisible_by_16(base_config)
     hints: list[SpeculativeHint] = []
 
     for i, arg in zip(indices, args):
-        if i in proven_set:
+        if i in proven_div16:
             continue
         if not isinstance(arg, SizeArg):
             continue
@@ -304,30 +370,38 @@ def speculative_hints(
         if arg.name.startswith("load_seed_offset"):
             continue
 
-        try:
-            concrete_hint = V.graph.sizevars.shape_env.size_hint(arg.expr, allow_none=True)
-        except Exception:
-            continue
-
-        if concrete_hint is not None and concrete_hint % 16 == 0:
-            hints.append(
-                SpeculativeHint(
-                    arg_index=i,
-                    arg_name=arg.name,
-                    check_type=HintCheckType.DIVISIBLE,
-                    check_value=16,
-                    sympy_expr=arg.expr,
-                )
+        # Any symbolic SizeArg not statically proven div16 gets a speculative hint.
+        # We don't check the concrete size_hint value — the runtime if/else handles
+        # both div16 and non-div16 shapes regardless of which is seen first.
+        hints.append(
+            SpeculativeHint(
+                arg_index=i,
+                arg_name=arg.name,
+                check_type=HintCheckType.DIVISIBLE,
+                check_value=16,
+                sympy_expr=arg.expr,
             )
+        )
 
     return hints
 
 
 def apply_hints(
-    base_config: Any,
+    args: list[KernelArgType],
     hints: list[SpeculativeHint],
+    *,
+    indices: list[int] | None = None,
 ) -> Any:
-    """Create a new config with speculative hints applied on top of base."""
-    extra_div16 = tuple(h.arg_index for h in hints if h.check_type == HintCheckType.DIVISIBLE)
-    new_div16 = tuple(sorted(set(base_config.divisible_by_16) | set(extra_div16)))
-    return AttrsDescriptorWrapper(new_div16, base_config.equal_to_1)
+    """Build an AttrsDescriptorWrapper with speculative divisibility hints applied.
+
+    Merges the statically-proven divisible_by_16 indices (from _is_aligned) with
+    the speculative hint indices to produce a config where all hinted args are
+    annotated as divisible by 16. Used for the fast kernel variant.
+    """
+    base_div16 = divisible_by_16_indices(args, indices=indices)
+    equal_to_1 = equal_1_arg_indices(args, indices=indices)
+    speculative_div16 = tuple(
+        h.arg_index for h in hints if h.check_type == HintCheckType.DIVISIBLE
+    )
+    merged_div16 = tuple(sorted(set(base_div16) | set(speculative_div16)))
+    return AttrsDescriptorWrapper(merged_div16, equal_to_1)

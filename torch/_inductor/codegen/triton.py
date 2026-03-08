@@ -141,10 +141,18 @@ async_compile = AsyncCompile()
 
 @dataclasses.dataclass
 class KernelVariant:
-    config: Any  # AttrsDescriptorWrapper
-    suffix: str  # "_div16" or "_general"
-    triton_meta: dict  # full triton_meta for this variant
-    src_code: str = ""  # filled after codegen
+    """A compiled Triton kernel variant with specific divisibility assumptions.
+
+    When speculative_divisibility is enabled, we AOT-compile multiple variants
+    of each kernel: a fast variant with tt.divisibility=16 annotations on
+    speculated SizeArgs, and a general fallback without. The wrapper emits
+    runtime if/else dispatch between them.
+    """
+
+    config: Any  # AttrsDescriptorWrapper for this variant's divisibility assumptions
+    suffix: str  # appended to kernel name, e.g. "_div16" or "_general"
+    triton_meta: dict  # full triton_meta dict with this variant's configs
+    src_code: str = ""  # Triton source code, filled after codegen via repr replacement
 
 # Threshold for detecting inner reductions based on tiling score ratio.
 # If r0_tiling_score / x_tiling_score >= this value, upgrade DEFAULT hint to INNER.
@@ -5611,11 +5619,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if flops is not None:
                 inductor_meta["kernel_flop"] = flops
 
-        base_config = config_of(signature)
-        hints = speculative_hints(signature, list(range(len(signature))), base_config)
+        # Speculative divisibility: compile fast (div16) + general kernel variants
+        # with runtime if/else dispatch, avoiding Dynamo guard pollution and 2^N
+        # recompilations. Disabled for cpp_wrapper (AOTI) which uses offline
+        # compilation with known shapes.
+        if not V.graph.cpp_wrapper:
+            base_config = config_of(signature)
+            hints = speculative_hints(signature, base_config)
+        else:
+            hints = []
 
-        if hints and not V.graph.cpp_wrapper:
-            fast_config = apply_hints(base_config, hints)
+        if hints:
+            # Fast variant: all speculative SizeArgs annotated as divisible by 16,
+            # enabling Triton to emit vectorized loads (LDG.E.128 vs LDG.E.16)
+            fast_config = apply_hints(signature, hints)
             triton_meta["configs"] = [fast_config]
             self.speculative_hints = hints
             self.variants: list[KernelVariant] = [
@@ -5624,6 +5641,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     suffix="_div16",
                     triton_meta={**triton_meta, "configs": [fast_config]},
                 ),
+                # General fallback: only statically-proven divisibility, always safe
                 KernelVariant(
                     config=base_config,
                     suffix="_general",
@@ -5631,7 +5649,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 ),
             ]
         else:
-            triton_meta["configs"] = [base_config]
+            # No speculation — single kernel, existing path
+            triton_meta["configs"] = [config_of(signature)]
             self.speculative_hints = []
             self.variants = []
 
@@ -5715,7 +5734,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         src_code = code.getvalue()
 
-        # Fill variant src_code by replacing triton_meta repr in the source
+        # Generate per-variant Triton source by replacing triton_meta in the source.
+        # The kernel body is identical across variants — only the @triton_heuristics
+        # decorator's triton_meta differs (different divisible_by_16 annotations).
+        # We replace the fast variant's triton_meta repr with each variant's own repr,
+        # which is much cheaper than running full codegen N times.
         if self.variants:
             fast_meta_repr = repr(self.variants[0].triton_meta)
             for variant in self.variants:
@@ -5866,21 +5889,30 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         hints: list[SpeculativeHint],
         call_args: list[Any],
     ) -> str | None:
-        """Build deduplicated runtime check from speculative hints resolved to call-site names."""
+        """Build a deduplicated runtime condition string for variant dispatch.
+
+        Resolves each hint's sympy_expr to the call-site variable name and formats
+        a check expression. Deduplicates by sympy_expr identity — multiple SizeArgs
+        at different signature positions can share the same symbol (e.g. ks0 and
+        r0_numel both mapping to s1), and we only need one runtime check per symbol.
+
+        Returns e.g. "s0 % 16 == 0 and s1 % 16 == 0", or None if no conditions.
+        """
         seen_exprs: set[sympy.Expr] = set()
         conditions: list[str] = []
         for hint in hints:
-            expr_key = hint.sympy_expr
-            if expr_key in seen_exprs:
+            if hint.sympy_expr in seen_exprs:
                 continue
-            seen_exprs.add(expr_key)
-            call_expr = (
+            seen_exprs.add(hint.sympy_expr)
+
+            # Resolve to the call-site variable name (e.g. "s0" not "ks0")
+            call_var = (
                 call_args[hint.arg_index]
                 if hint.arg_index < len(call_args)
-                else hint.arg_name
+                else hint.arg_name  # fallback to kernel arg name
             )
             if hint.check_type == HintCheckType.DIVISIBLE:
-                conditions.append(f"{call_expr} % {hint.check_value} == 0")
+                conditions.append(f"{call_var} % {hint.check_value} == 0")
         return " and ".join(conditions) if conditions else None
 
     def codegen_nan_check(self) -> None:
@@ -6401,58 +6433,34 @@ class TritonScheduling(SIMDScheduling):
             # use the original src_code as the key
             wrapper.src_to_kernel[src_code] = kernel_name
 
+            # Emit kernel definitions: one per variant if speculative dispatch is active,
+            # otherwise just the single base kernel. Each entry is (name, source).
             if getattr(kernel, "variants", None):
-                # Multi-variant path: emit each variant as a separate kernel
-                for variant in kernel.variants:
-                    variant_name = kernel_name + variant.suffix
-                    variant_src = variant.src_code
-                    variant_src = variant_src.replace(
-                        str(Placeholder.DESCRIPTIVE_NAME), variant_name
-                    )
-                    variant_subs = (
-                        variant_name
-                        if config.triton.unique_kernel_names
-                        else "triton_"
-                    )
-                    variant_src = variant_src.replace(
-                        str(Placeholder.KERNEL_NAME), variant_subs
-                    )
-                    variant_src = variant_src.replace("#pragma CMT", "#")
-                    _basename, _, variant_path = get_path(
-                        code_hash(variant_src.strip()), "py"
-                    )
-                    self._emit_kernel_to_wrapper(
-                        wrapper,
-                        kernel,
-                        variant_src,
-                        variant_name,
-                        variant_subs,
-                        node_schedule,
-                        variant_path,
-                        get_kernel_metadata,
-                    )
+                emit_list = [
+                    (kernel_name + v.suffix, v.src_code) for v in kernel.variants
+                ]
             else:
-                # Single-kernel path (original)
+                emit_list = [(kernel_name, src_code)]
+
+            for emit_name, emit_src in emit_list:
                 subs_name = (
-                    kernel_name
-                    if config.triton.unique_kernel_names
-                    else "triton_"
+                    emit_name if config.triton.unique_kernel_names else "triton_"
                 )
-                src_code = src_code.replace(
-                    str(Placeholder.DESCRIPTIVE_NAME), kernel_name
+                emit_src = emit_src.replace(
+                    str(Placeholder.DESCRIPTIVE_NAME), emit_name
                 )
-                src_code = src_code.replace(
+                emit_src = emit_src.replace(
                     str(Placeholder.KERNEL_NAME), subs_name
                 )
-                src_code = src_code.replace("#pragma CMT", "#")
+                emit_src = emit_src.replace("#pragma CMT", "#")
                 _basename, _, kernel_path = get_path(
-                    code_hash(src_code.strip()), "py"
+                    code_hash(emit_src.strip()), "py"
                 )
                 self._emit_kernel_to_wrapper(
                     wrapper,
                     kernel,
-                    src_code,
-                    kernel_name,
+                    emit_src,
+                    emit_name,
                     subs_name,
                     node_schedule,
                     kernel_path,

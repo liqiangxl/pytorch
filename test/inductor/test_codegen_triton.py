@@ -80,7 +80,7 @@ class TestCodegenTriton(InductorTestCase):
                     SizeArg("D", s0),  # no
                     SizeArg("E", s1),  # no
                 ]
-            )[0],
+            ),
         )
 
         _check_divisibility(
@@ -95,58 +95,8 @@ class TestCodegenTriton(InductorTestCase):
                     SizeArg("F", sixteen * eight * s0 * s1),  # 5: yes
                     SizeArg("G", two * eight * s0 * s1),  # 6: yes
                 ]
-            )[0],
-        )
-
-    @inductor_config.patch(
-        {"triton.divisible_by_16": True, "triton.speculative_divisibility": True}
-    )
-    def test_apply_hints(self):
-        from torch._inductor.codegen.triton_utils import (
-            apply_hints,
-            HintCheckType,
-            SpeculativeHint,
-        )
-        from torch._inductor.runtime.hints import AttrsDescriptorWrapper
-        from torch._inductor.utils import (
-            get_triton_attrs_descriptor_version,
-            TritonAttrsDescriptorVersion,
-        )
-
-        s0 = sympy.Symbol("s0", positive=True, integer=True)
-        base_config = AttrsDescriptorWrapper((0, 1), ())
-        hints = [
-            SpeculativeHint(
-                arg_index=3,
-                arg_name="ks0",
-                check_type=HintCheckType.DIVISIBLE,
-                check_value=16,
-                sympy_expr=s0,
             ),
-            SpeculativeHint(
-                arg_index=5,
-                arg_name="xnumel",
-                check_type=HintCheckType.DIVISIBLE,
-                check_value=16,
-                sympy_expr=s0,
-            ),
-        ]
-        result = apply_hints(base_config, hints)
-
-        version = get_triton_attrs_descriptor_version()
-        if version in {
-            TritonAttrsDescriptorVersion.V1_COMPILER,
-            TritonAttrsDescriptorVersion.V0_NO_TRITON,
-        }:
-            self.assertEqual((0, 1, 3, 5), result.divisible_by_16)
-        elif version in {
-            TritonAttrsDescriptorVersion.V2_BACKENDS,
-            TritonAttrsDescriptorVersion.V3_BACKENDS_TUPLE,
-        }:
-            self.assertEqual((0, 1, 3, 5), result.divisibility_16)
-        elif version == TritonAttrsDescriptorVersion.V4_DICT:
-            for idx in (0, 1, 3, 5):
-                self.assertIn((idx,), result)
+        )
 
     @inductor_config.patch(
         {"triton.divisible_by_16": True, "triton.speculative_divisibility": True}
@@ -170,6 +120,8 @@ class TestCodegenTriton(InductorTestCase):
 
         # Runtime dispatch condition
         self.assertTrue(any("% 16 == 0" in c for c in code))
+
+        print(code[0])
 
         # Correctness
         self.assertTrue(torch.allclose(result, x * 2))

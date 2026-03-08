@@ -3448,7 +3448,18 @@ class PythonWrapperCodegen(CodeGen):
         device=None,
         graph_name="",
     ):
-        """Emit if/else dispatch between N kernel variants."""
+        """Emit runtime if/else dispatch between N kernel variants.
+
+        Generates code like:
+            if s0 % 16 == 0:
+                kernel_div16.run(args, stream=stream0)
+            else:
+                kernel_general.run(args, stream=stream0)
+
+        The first variant gets the runtime_condition as its `if` guard.
+        The last variant is always the `else` fallback (no condition).
+        Intermediate variants (for N>2 strategies) use per-variant conditions.
+        """
         device = device or V.graph.get_current_device_or_throw()
         call_args_str = ", ".join(self.prepare_triton_kernel_call(call_args))
         stream_name = PythonWrapperCodegen.write_get_raw_stream(
@@ -3457,19 +3468,18 @@ class PythonWrapperCodegen(CodeGen):
         self.write_triton_header_once()
 
         for i, variant in enumerate(variants):
-            suffixed_name = kernel_name + variant.suffix
-            call_line = f"{suffixed_name}.run({call_args_str}, stream={stream_name})"
+            variant_name = kernel_name + variant.suffix
+            run_call = f"{variant_name}.run({call_args_str}, stream={stream_name})"
 
             if i == 0 and runtime_condition:
                 self.writeline(f"if {runtime_condition}:")
-                self.writeline(f"    {call_line}")
+                self.writeline(f"    {run_call}")
             elif i == len(variants) - 1:
                 self.writeline("else:")
-                self.writeline(f"    {call_line}")
+                self.writeline(f"    {run_call}")
             else:
-                # Intermediate variants (for N>2 strategies)
                 self.writeline(f"elif {getattr(variant, 'condition', 'True')}:")
-                self.writeline(f"    {call_line}")
+                self.writeline(f"    {run_call}")
 
     def writeline(self, line):
         self.lines.append(line)

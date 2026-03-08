@@ -1713,7 +1713,7 @@ class triton:
     # AOT-compile fast (div16) + general kernel variants with runtime dispatch
     # for SizeArgs whose concrete hint is divisible by 16 but not statically provable.
     speculative_divisibility = (
-        os.environ.get("TORCHINDUCTOR_SPECULATIVE_DIVISIBILITY", "0") == "1"
+        os.environ.get("TORCHINDUCTOR_SPECULATIVE_DIVISIBILITY", "1") == "1"
     )
 
     # Minimum R0_BLOCK to be used for a TritonSplitScanKernel
