@@ -299,21 +299,21 @@ def _get_divisible_by_16(attrs_config: Any) -> set[int]:
     return set()
 
 
-def fast_variant_config(
+def config_with_speculative_divisible(
     args: list[KernelArgType],
     base_config: Any,
     *,
     indices: list[int] | None = None,
 ) -> tuple[Any, list[tuple[int, sympy.Expr]]] | tuple[None, None]:
-    """Build a fast-variant config with all symbolic SizeArgs annotated as div16.
+    """Build a config with all symbolic SizeArgs speculatively annotated as div16.
 
     When dynamic=True, SizeArgs (strides, numels) may not be statically provable
     as divisible by 16, preventing Triton from emitting vectorized loads. This
-    function builds a fast-variant config that speculatively annotates all such
-    SizeArgs as div16, paired with a list of (arg_index, sympy_expr) for building
-    a runtime dispatch condition.
+    function builds a config that speculatively annotates all such SizeArgs as
+    div16, paired with a list of (arg_index, sympy_expr) for building a runtime
+    dispatch condition.
 
-    Returns (fast_config, check_args) or (None, None) if no speculation is needed.
+    Returns (config, speculative_args) or (None, None) if no speculation is needed.
     """
     if not config.triton.speculative_divisibility:
         return None, None
@@ -328,10 +328,6 @@ def fast_variant_config(
         if i in proven_div16:
             continue
         if not isinstance(arg, SizeArg):
-            continue
-        if arg.expr is None or isinstance(arg.expr, float):
-            continue
-        if arg.name.startswith("load_seed_offset"):
             continue
         extra.append((i, arg.expr))
 

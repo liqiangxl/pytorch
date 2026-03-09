@@ -109,7 +109,7 @@ from .simd import (
 from .triton_utils import (
     config_of,
     equal_1_arg_indices,
-    fast_variant_config,
+    config_with_speculative_divisible,
     non_constexpr_signature,
     should_unwrap_unspec_arg,
     signature_to_meta,
@@ -5622,13 +5622,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # compilation with known shapes.
         if not V.graph.cpp_wrapper:
             base_config = config_of(signature)
-            fast_config, check_args = fast_variant_config(signature, base_config)
+            fast_config, speculative_args = config_with_speculative_divisible(signature, base_config)
         else:
-            fast_config, check_args = None, None
+            fast_config, speculative_args = None, None
 
-        if fast_config is not None and check_args is not None:
+        if fast_config is not None and speculative_args is not None:
             triton_meta["configs"] = [fast_config]
-            self._variant_check_args = check_args
+            self._speculative_args = speculative_args
             self.variants: list[KernelVariant] = [
                 KernelVariant(
                     config=fast_config,
@@ -5644,7 +5644,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         else:
             # No speculation — single kernel, existing path
             triton_meta["configs"] = [config_of(signature)]
-            self._variant_check_args = []
+            self._speculative_args = []
             self.variants = []
 
         # Triton compiler includes equal_to_1 args into constants even
@@ -5852,7 +5852,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.variants:
             runtime_condition = self._build_runtime_condition(
-                self._variant_check_args, call_args
+                self._speculative_args, call_args
             )
             wrapper.generate_kernel_call(
                 name,
@@ -5879,7 +5879,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _build_runtime_condition(
         self,
-        check_args: list[tuple[int, sympy.Expr]],
+        speculative_args: list[tuple[int, sympy.Expr]],
         call_args: list[Any],
     ) -> str | None:
         """Build a single bitwise OR runtime condition for variant dispatch.
@@ -5890,7 +5890,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         seen_exprs: set[sympy.Expr] = set()
         check_vars: list[str] = []
-        for arg_index, sympy_expr in check_args:
+        for arg_index, sympy_expr in speculative_args:
             if sympy_expr in seen_exprs:
                 continue
             seen_exprs.add(sympy_expr)
