@@ -315,9 +315,6 @@ def config_with_speculative_divisible(
 
     Returns (config, speculative_args) or (None, None) if no speculation is needed.
     """
-    if not config.triton.speculative_divisibility:
-        return None, None
-
     if indices is None:
         indices = list(range(len(args)))
 
@@ -328,6 +325,12 @@ def config_with_speculative_divisible(
         if i in proven_div16:
             continue
         if not isinstance(arg, SizeArg):
+            continue
+        if arg.name.startswith("load_seed_offset"):
+            continue
+        if arg.expr is None:
+            continue
+        if isinstance(arg.expr, float):
             continue
         extra.append((i, arg.expr))
 

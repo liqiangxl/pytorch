@@ -5620,8 +5620,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # with runtime if/else dispatch, avoiding Dynamo guard pollution and 2^N
         # recompilations. Disabled for cpp_wrapper (AOTI) which uses offline
         # compilation with known shapes.
-        if not V.graph.cpp_wrapper:
-            base_config = config_of(signature)
+        base_config = config_of(signature)
+        if not V.graph.cpp_wrapper and config.triton.speculative_divisibility:
             fast_config, speculative_args = config_with_speculative_divisible(signature, base_config)
         else:
             fast_config, speculative_args = None, None
@@ -5643,7 +5643,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             ]
         else:
             # No speculation — single kernel, existing path
-            triton_meta["configs"] = [config_of(signature)]
+            triton_meta["configs"] = [base_config]
             self._speculative_args = []
             self.variants = []
 
