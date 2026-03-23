@@ -68,6 +68,7 @@ from ..scheduler import (
 from ..shape_propagation import get_broadcasted_shape
 from ..utils import (
     cache_on_self,
+    DeferredLineBase,
     DelayReplaceLine,
     get_bounds_index_expr,
     get_fused_kernel_name,
@@ -324,6 +325,45 @@ class TritonSymbols:
     @classmethod
     def get_block_offset(cls, tree: IterationRanges) -> sympy.Symbol:
         return cls.block_offsets[tree.symt]
+
+class IfThenElse(DeferredLineBase):
+    """A line that renders as an if/else block in generated Triton code.
+
+    Subclasses DeferredLineBase so it can live in IndentedBuffer._lines
+    and be rendered by getvalue() via __call__().
+    """
+
+    def __init__(
+        self,
+        predicate: str,
+        then_body: IndentedBuffer,
+        else_body: IndentedBuffer | None = None,
+    ):
+        super().__init__(predicate)
+        self.predicate = predicate
+        self.then_body = then_body
+        self.else_body = else_body
+
+    def __call__(self) -> str:
+        # Extract indent from self.line (which has prefix baked in by writeline)
+        indent = self.line[: len(self.line) - len(self.line.lstrip())]
+        body_indent = indent + "    "
+
+        lines = [f"{indent}if {self.predicate}:"]
+        for then_line in self.then_body.getvalue().splitlines():
+            lines.append(f"{body_indent}{then_line}" if then_line.strip() else "")
+
+        if self.else_body is not None:
+            lines.append(f"{indent}else:")
+            for else_line in self.else_body.getvalue().splitlines():
+                lines.append(f"{body_indent}{else_line}" if else_line.strip() else "")
+
+        return "\n".join(lines)
+
+    def _new_line(self, line: str) -> IfThenElse:
+        ite = IfThenElse(self.predicate, self.then_body, self.else_body)
+        ite.line = line
+        return ite
 
 
 @dataclasses.dataclass
@@ -2702,6 +2742,17 @@ class TMACompatibilityChecker:
         """
         return self.force
 
+def _should_use_xmask_unswitch(kernel: "TritonKernel") -> bool:
+    """Whether IfThenElse mask optimization may apply.
+
+    Config flag must be enabled and x-dimension numel must be dynamic.
+    Per-op eligibility (xmask is sole mask) is checked at load/store sites.
+    """
+    if not config.triton.xmask_unswitch:
+        return False
+    xtree = kernel.range_trees[0]
+    return not isinstance(xtree.numel, (sympy.Integer, int))
+
 
 class TritonKernel(SIMDKernel[TritonCSEVariable]):
     """A class to represent a triton kernel and helpers to generate
@@ -2741,6 +2792,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.post_loop_store: IndentedBuffer = IndentedBuffer()
         self.outside_loop_vars = OrderedSet[Any]()
         self.min_elem_per_thread = min_elem_per_thread
+        # Map masked expr → unmasked expr for xmask unswitch optimization.
+        # Populated by load()/store() when xmask is the sole mask.
+        self._xmask_unswitch_map: dict[str, str] = {}
+        self._use_xmask_unswitch = _should_use_xmask_unswitch(self)
         self.block_ptr_id = itertools.count()
         self.block_ptr_to_buffer = dict[str, str]()
         self.helper_functions = HelperFunctions()
@@ -3763,6 +3818,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         append_broadcast = None
         shape: BlockShapeType = None
+        _register_xmask_load = False
 
         if should_unwrap_unspec_arg(name):
             line = var
@@ -3798,6 +3854,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 shape = ()
             else:
                 line = f"tl.load({var} + ({indexing.index_str}), {indexing.mask_str}{ep}{other}{cachemod})"
+                # Register unmasked variant for xmask unswitch optimization.
+                _register_xmask_load = (
+                    self._use_xmask_unswitch
+                    and indexing.mask_vars == {"xmask"}
+                )
+                if _register_xmask_load:
+                    unmasked_line = f"tl.load({var} + ({indexing.index_str}), None{ep}{other}{cachemod})"
 
                 # The block shape of tl.load depends on the indexing expression.
                 # Inferring shape solely from the mask may miss cases where the mask is constant.
@@ -3813,12 +3876,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 and config.triton.codegen_upcast_to_fp32
             ):
                 line += ".to(tl.float32)"
+                if _register_xmask_load:
+                    unmasked_line += ".to(tl.float32)"
                 dtype = torch.float32
             if dtype == torch.bool and torch.version.hip is None:
-                # Workaround for https://github.com/triton-lang/triton/issues/2151
-                # tl.load returns int8 when loading from pointer to int1
-                # NOTE: Currently causes hangs on bool UTs for ROCm
                 line += ".to(tl.int1)"
+                if _register_xmask_load:
+                    unmasked_line += ".to(tl.int1)"
                 dtype = torch.bool
 
         load_buffer = self.get_load_buffer(indexing)
@@ -3831,6 +3895,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             load_counts[name] -= 1  # don't double count cache hit
         assert isinstance(result_var, TritonCSEVariable)
         result_var.mask_vars = indexing.mask_vars  # type: ignore[assignment]
+
+        if _register_xmask_load:
+            self._xmask_unswitch_map[f"{result_var} = {line}"] = (
+                f"{result_var} = {unmasked_line}"
+            )
 
         if append_broadcast:
             line = f"tl.broadcast_to({result_var}, {append_broadcast})"
@@ -3925,6 +3994,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     value_shape = ", ".join(map(str, value.shape))
                     indexing_str += f".broadcast_to({value_shape})"
             line = f"tl.store({var} + ({indexing_str}), {value}, {indexing.mask_str})"
+            # Register unmasked variant for xmask unswitch optimization.
+            if (
+                self._use_xmask_unswitch
+                and isinstance(indexing, IndexingOptions)
+                and indexing.mask_vars == {"xmask"}
+            ):
+                self._xmask_unswitch_map[line] = (
+                    f"tl.store({var} + ({indexing_str}), {value}, None)"
+                )
         elif mode == "atomic_add":
             self.atomic_add_found = True
             indexing_str = indexing.index_str
@@ -5236,10 +5314,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.cse.invalidate(self.outside_loop_vars)
                 tree.cache_clear()
         else:
-            self.body.splice(self.indexing_code)
-            self.body.splice(self.loads)
-            self.body.splice(self.compute)
-            self.body.splice(self.stores)
+            self._codegen_pointwise_body()
         self.body.splice(self.post_loop_combine)
         if self.cooperative_reduction and (
             self.post_loop_combine or self.post_loop_store
@@ -6123,6 +6198,54 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         xtree = self.range_trees[0]
         assert xtree.prefix == "x"
         return self._has_constant_mask(xtree)
+
+    def _codegen_pointwise_body(self) -> None:
+        """Splice indexing/loads/compute/stores into self.body.
+
+        When xmask unswitch is active, wraps the body in an IfThenElse:
+        the then-branch uses unmasked load/store variants for vectorized
+        access on full blocks; the else-branch keeps original masked code.
+        Otherwise, splices the buffers directly.
+        """
+        all_bufs = [self.indexing_code, self.loads, self.compute, self.stores]
+
+        if not self._xmask_unswitch_map:
+            for buf in all_bufs:
+                self.body.splice(buf)
+            return
+
+        # Render all staging buffers to lines
+        masked_lines = []
+        for buf in all_bufs:
+            masked_lines.extend(buf.getvalue().splitlines())
+
+        # Build then-body (unmasked) using the registered map
+        then_body = IndentedBuffer()
+        unswitch = self._xmask_unswitch_map
+        for line_str in masked_lines:
+            stripped = line_str.lstrip()
+            if stripped.startswith("xmask = "):
+                continue
+            if stripped in unswitch:
+                indent = line_str[: len(line_str) - len(stripped)]
+                line_str = indent + unswitch[stripped]
+            then_body.writeline(line_str)
+
+        # Build else-body (masked) — original code as-is
+        else_body = IndentedBuffer()
+        for line_str in masked_lines:
+            else_body.writeline(line_str)
+
+        # Filter PDL lines before wrapping — _filter_pdl only inspects
+        # top-level body._lines and cannot see inside IfThenElse bodies.
+        self._filter_pdl(then_body)
+        self._filter_pdl(else_body)
+
+        # IfThenElse is a DeferredLineBase: it looks like a single "line"
+        # to IndentedBuffer, but expands into a multi-line if/else block
+        # when the buffer renders via getvalue() → ite.__call__().
+        ite = IfThenElse("xoffset + XBLOCK <= xnumel", then_body, else_body)
+        self.body.writeline(ite)
 
     def filter_masks(self, mask_vars: OrderedSet[str]) -> None:
         for tree in self.range_trees:

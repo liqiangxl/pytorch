@@ -203,6 +203,84 @@ class TestCodegenTriton(InductorTestCase):
         self.assertIn("tt.pointer_range", code_str)
 
 
+class TestXmaskUnswitch(InductorTestCase):
+    """Test the xmask_unswitch codegen optimization.
+
+    The unswitched pattern is only generated for dynamic shapes where xnumel
+    is symbolic. For static shapes, Triton already specializes on the
+    actual value via divisibility hints.
+    """
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @inductor_config.patch("triton.xmask_unswitch", True)
+    def test_dynamic_shape_generates_unswitch(self):
+        """Dynamic (symbolic) xnumel should emit unswitched pattern."""
+
+        def fn(x):
+            return x * 3.0 + 1.0
+
+        x = torch.randn(4097, device=GPU_TYPE, dtype=torch.float16)
+        result, code = run_and_get_code(torch.compile(fn, dynamic=True), x)
+        code_str = "\n".join(code)
+        self.assertIn("xoffset + XBLOCK <= xnumel", code_str)
+        # The if-branch should have unmasked load/store (None)
+        # The else-branch should have masked load/store (xmask)
+        self.assertIn(", None)", code_str)
+        self.assertIn(", xmask)", code_str)
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @inductor_config.patch("triton.xmask_unswitch", True)
+    def test_static_shape_no_unswitch(self):
+        """Static shapes should NOT emit unswitch — Triton specializes
+        on the actual value via divisibility hints."""
+
+        def fn(x):
+            return x * 3.0 + 1.0
+
+        x = torch.randn(1000, device=GPU_TYPE, dtype=torch.float16)
+        _, code = run_and_get_code(torch.compile(fn), x)
+        code_str = "\n".join(code)
+        self.assertNotIn("xoffset + XBLOCK <= xnumel", code_str)
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @inductor_config.patch("triton.xmask_unswitch", True)
+    def test_2d_transpose_no_unswitch(self):
+        """2D tiled kernels (e.g. transpose) should NOT emit unswitch
+        because both x and y masks are dynamic."""
+
+        def fn(a, b):
+            return a + b.T
+
+        a = torch.randn(33, 17, device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn(17, 33, device=GPU_TYPE, dtype=torch.float16)
+        _, code = run_and_get_code(torch.compile(fn, dynamic=True), a, b)
+        code_str = "\n".join(code)
+        self.assertNotIn("xoffset + XBLOCK <= xnumel", code_str)
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    @inductor_config.patch({"triton.xmask_unswitch": True, "triton.enable_pdl": True})
+    def test_pdl_filter_inside_unswitch(self):
+        """PDL gdc_wait/gdc_launch lines inside IfThenElse branches should be
+        deduplicated by _filter_pdl, even though they live inside sub-buffers.
+        """
+
+        def fn(x, y):
+            return x + y
+
+        x = torch.randn(1000, device=GPU_TYPE)
+        y = torch.randn(1000, device=GPU_TYPE)
+        _, code = run_and_get_code(torch.compile(fn, dynamic=True), x, y)
+        code_str = "\n".join(code)
+
+        # Sanity: unswitch is active
+        self.assertIn("xoffset + XBLOCK <= xnumel", code_str)
+
+        # Each branch should have exactly 1 gdc_wait (deduplicated).
+        then_else = code_str.split("xoffset + XBLOCK <= xnumel")[1]
+        then_branch = then_else.split("else:")[0]
+        self.assertEqual(then_branch.count("gdc_wait"), 1)
+
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 

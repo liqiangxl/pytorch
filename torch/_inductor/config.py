@@ -1761,6 +1761,11 @@ class triton:
     # hint to Triton when arguments are divisible by 16
     divisible_by_16 = os.environ.get("TORCHINDUCTOR_DIVISIBLE_BY_16", "1") == "1"
 
+    # Use if-else pattern in pointwise kernels to enable vectorized loads/stores
+    # for full blocks when xnumel is not statically known to be aligned.
+    # Generates: if xoffset + XBLOCK <= xnumel: <unmasked> else: <masked>
+    xmask_unswitch = os.environ.get("TORCHINDUCTOR_XMASK_UNSWITCH", "1") == "1"
+
     # Minimum R0_BLOCK to be used for a TritonSplitScanKernel
     # NOTE: This also indirectly controls the size of workspace buffer required
     min_split_scan_rblock = 256
