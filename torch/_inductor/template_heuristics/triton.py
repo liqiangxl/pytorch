@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import logging
 import math
 import os
 from functools import partial
@@ -11,6 +12,8 @@ from typing import Any, TYPE_CHECKING
 import sympy
 
 import torch
+
+log = logging.getLogger(__name__)
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import Mod
@@ -124,6 +127,62 @@ class FlexConfig:
     block_n: int
     num_stages: int
     num_warps: int
+
+
+def _estimate_flex_smem(
+    block_m: int, block_n: int, num_stages: int, head_dim: int, dtype_bytes: int
+) -> int:
+    """Estimate shared memory bytes for a flex_attention forward kernel.
+
+    The Triton kernel pipelines K and V tiles through shared memory in the
+    inner KV loop, and also places the Q tile in shared memory for tl.dot.
+
+    Per-block shared memory:
+      Q tile:        BLOCK_M * head_dim_rounded * dtype_bytes
+      K + V tiles:   BLOCK_N * head_dim_rounded * dtype_bytes * stages * 2
+      mbarrier overhead: ~4 KB (Triton pipeline barriers and alignment padding)
+    """
+    head_dim_rounded = max(16, 1 << (head_dim - 1).bit_length())
+    q_bytes = block_m * head_dim_rounded * dtype_bytes
+    kv_bytes = num_stages * block_n * 2 * head_dim_rounded * dtype_bytes
+    mbarrier_bytes = 4096
+    return q_bytes + kv_bytes + mbarrier_bytes
+
+
+def _smem_constrained_flex_config(
+    default: FlexConfig, head_dim: int, dtype: Any
+) -> FlexConfig:
+    """Return *default* if it fits in shared memory, else a smaller config.
+
+    Progressively reduces pipeline stages then tile size until the estimated
+    shared memory fits within the device's shared_memory_per_block_optin.
+    See https://github.com/pytorch/pytorch/issues/180278
+    """
+    smem_limit = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
+    dtype_bytes = 4 if dtype == torch.float32 else 2
+    if (
+        _estimate_flex_smem(
+            default.block_m, default.block_n, default.num_stages, head_dim, dtype_bytes
+        )
+        <= smem_limit
+    ):
+        return default
+    # First reduce pipeline stages, then halve tile size
+    for stages in [2, 1]:
+        for bn in [default.block_n, default.block_n // 2, 32, 16]:
+            bm = min(bn, default.block_m)
+            if _estimate_flex_smem(bm, bn, stages, head_dim, dtype_bytes) <= smem_limit:
+                return FlexConfig(bm, bn, stages, default.num_warps)
+    # Last resort — should always fit
+    log.warning(
+        "flex_attention: all fallback configs exceed shared memory limit (%d bytes) "
+        "for head_dim=%d, falling back to FlexConfig(16, 16, 1, 4)",
+        smem_limit,
+        head_dim,
+    )
+    return FlexConfig(16, 16, 1, 4)
 
 
 @dataclasses.dataclass
@@ -1352,6 +1411,9 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                 default_config = FlexConfig(64, 32, 3, 4)
 
         if default_config not in flex_attn_fwd_configs:
+            default_config = _smem_constrained_flex_config(
+                default_config, head_dim, dtype
+            )
             flex_attn_fwd_configs.append(default_config)
 
         return flex_attn_fwd_configs
