@@ -103,6 +103,101 @@ class SIMDKernelFeatures:
         return [n for n in self.scheduler_nodes() if n.is_reduction()]
 
     @cache_on_self
+    def reduction_and_epilogue_nodes(
+        self,
+    ) -> tuple[tuple[SchedulerNode, ...], tuple[SchedulerNode, ...]] | None:
+        """Return the reduction segment and fused epilogue segment, if simple.
+
+        Register-tiled persistent reductions need to retain source loads across
+        the reduction/epilogue boundary.  This helper recognizes the common
+        schedule shapes Inductor emits for a fused reduction plus broadcasted
+        pointwise epilogue::
+
+            reduction nodes, DisableReduction, epilogue nodes, EnableReduction
+            reduction nodes, DisableReduction, EnableReduction, epilogue nodes
+
+        More complicated schedules should fall back until tiled replay supports
+        them explicitly.
+        """
+        if DisableReduction not in self.node_schedule:
+            return None
+
+        try:
+            disable_idx = self.node_schedule.index(DisableReduction)
+            enable_idx = self.node_schedule.index(EnableReduction, disable_idx + 1)
+        except ValueError:
+            return None
+
+        # Keep the first implementation conservative: one reduction segment and
+        # one epilogue segment.  Inductor currently emits both of these shapes:
+        #
+        #   reductions, DisableReduction, epilogues, EnableReduction
+        #   reductions, DisableReduction, EnableReduction, epilogues
+        #
+        # The second form appears for RMSNorm-style kernels where the epilogue is
+        # scheduled after the marker pair but still lowered as the second
+        # reduction-dimension loop.
+        between_markers = self.node_schedule[disable_idx + 1 : enable_idx]
+        after_enable = self.node_schedule[enable_idx + 1 :]
+        if any(
+            marker in after_enable for marker in (DisableReduction, EnableReduction)
+        ):
+            return None
+
+        reductions = tuple(
+            node
+            for node in self.node_schedule[:disable_idx]
+            if isinstance(node, SchedulerNode)
+        )
+        epilogue_entries = between_markers if between_markers else after_enable
+        epilogues = tuple(
+            node for node in epilogue_entries if isinstance(node, SchedulerNode)
+        )
+
+        if not reductions or not epilogues:
+            return None
+        if any(not node.is_reduction() for node in reductions):
+            return None
+        if any(node.is_reduction() for node in epilogues):
+            return None
+        return reductions, epilogues
+
+    @cache_on_self
+    def reduction_epilogue_shared_memory_deps(self) -> tuple[MemoryDep, ...]:
+        """Memory reads shared exactly by reduction and fused epilogue segments.
+
+        These are the source tensor elements a source-retained tiled kernel can
+        load once per tile, use for the reduction, and forward into epilogue
+        replay.  Matching on full MemoryDep rather than only buffer name keeps
+        the initial forwarding rule conservative: the buffer, index expression,
+        loop variables, and ranges must already agree.
+        """
+        segments = self.reduction_and_epilogue_nodes()
+        if segments is None:
+            return ()
+        reductions, epilogues = segments
+
+        def read_deps(nodes: tuple[SchedulerNode, ...]) -> OrderedSet[MemoryDep]:
+            deps: OrderedSet[MemoryDep] = OrderedSet()
+            for node in nodes:
+                for dep in node.read_writes.reads:
+                    if isinstance(dep, MemoryDep):
+                        deps.add(dep)
+            return deps
+
+        reduction_reads = read_deps(reductions)
+        epilogue_reads = read_deps(epilogues)
+        return tuple(dep for dep in reduction_reads if dep in epilogue_reads)
+
+    @cache_on_self
+    def reduction_epilogue_shared_read_names(self) -> tuple[str, ...]:
+        """Buffer names for exact shared reduction/epilogue memory reads."""
+        names: OrderedSet[str] = OrderedSet()
+        for dep in self.reduction_epilogue_shared_memory_deps():
+            names.add(dep.name)
+        return tuple(names)
+
+    @cache_on_self
     def buf_accesses(self) -> dict[str, list[Dep]]:
         """only needed for config.benchmark_kernel"""
         buf_accesses = collections.defaultdict(list)

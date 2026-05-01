@@ -445,6 +445,63 @@ class InductorChoices:
         )  # type: ignore[arg-types]
 
     @staticmethod
+    def should_use_register_tiled_persistent_reduction(
+        features: SIMDKernelFeatures, cooperative_reduction: bool
+    ) -> bool:
+        """Heuristic gate for source-retained register-tiled persistent reductions.
+
+        This does not enable the alternate codegen by itself yet; it identifies
+        safe, high-value candidates for the tiled replay path.  Keeping this
+        separate from should_use_persistent_reduction avoids the blanket flat
+        persistent threshold bump that regresses large reductions.
+        """
+        if not config.triton.register_tiled_persistent_reductions:
+            return False
+        if cooperative_reduction or not features.is_reduction():
+            return False
+
+        device = V.graph.get_current_device_or_throw()
+        if device.type != "cuda" or torch.version.hip:
+            return False
+
+        if features.get_reduction_hint() != ReductionHint.INNER:
+            return False
+        if features.contains_op("scan") or features.contains_op("sort"):
+            return False
+        if not features.reduction_epilogue_shared_read_names():
+            return False
+
+        bounds = bound_sympy(features.reduction_numel)
+        lower = bounds.lower
+        upper = bounds.upper
+        if not all(
+            (isinstance(bound, int) or bound.is_constant())
+            and not torch.utils._sympy.numbers.is_infinite(bound)
+            for bound in (lower, upper)
+        ):
+            return False
+        if int(lower) != int(upper):
+            return False
+
+        rnumel = int(upper)
+        tile = max(config.triton.register_tiled_persistent_reduction_tile_size, 1)
+        max_tiles = max(config.triton.register_tiled_persistent_reduction_max_tiles, 1)
+        min_numel = config.triton.register_tiled_persistent_reduction_min_numel
+        if rnumel < min_numel:
+            return False
+        if rnumel > tile * max_tiles:
+            return False
+
+        # The initial source-retained implementation is designed around static
+        # unrolled tiles so each tile gets distinct retained source variables.
+        # Non-powers-of-two can be supported with masks, but start conservative
+        # to avoid code-size and masking surprises.
+        if next_power_of_2(rnumel) != rnumel:
+            return False
+
+        return True
+
+    @staticmethod
     def reduction_split_factor(
         device: torch.device,
         reduction_numel_hint: int,

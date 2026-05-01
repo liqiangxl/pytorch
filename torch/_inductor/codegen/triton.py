@@ -2996,6 +2996,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.features, self.cooperative_reduction
         )
 
+    def should_use_register_tiled_persistent_reduction(self) -> bool:
+        return (
+            self.inside_reduction
+            and not self.persistent_reduction
+            and V.choices.should_use_register_tiled_persistent_reduction(
+                self.features, self.cooperative_reduction
+            )
+        )
+
     def want_no_x_dim(self):
         return (
             self.persistent_reduction
@@ -5651,6 +5660,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             out["persistent_reduction"] = self.persistent_reduction
         if self.add_persistent_rblock:
             out["add_persistent_rblock"] = True
+        if self.register_tiled_persistent_reduction_candidate:
+            out["register_tiled_persistent_reduction_candidate"] = True
+            out["register_tiled_persistent_reduction_shared_reads"] = (
+                self.features.reduction_epilogue_shared_read_names()
+            )
         if (
             config.benchmark_kernel
             or config.profile_bandwidth

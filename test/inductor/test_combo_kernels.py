@@ -10,7 +10,7 @@ import unittest
 
 import torch
 import torch._inductor
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import fresh_cache, run_and_get_code
 from torch.testing import FileCheck
 from torch.testing._internal.common_cuda import SM90OrLater
 from torch.testing._internal.common_utils import (
@@ -1863,6 +1863,27 @@ class ComboKernelMetadataTests(TestCase):
         code = self._combo_code(fn, inps)
         self.assertNotIn("'kernel_num_gb'", code)
         self.assertNotIn("'kernel_flop'", code)
+
+    @requires_cuda_and_triton
+    @torch._inductor.config.patch(
+        {
+            "triton.register_tiled_persistent_reductions": True,
+            "triton.multi_kernel": 0,
+        }
+    )
+    def test_register_tiled_persistent_reduction_candidate_metadata(self):
+        def rms_norm(x, w, eps=1e-6):
+            v = x.pow(2).mean(-1, keepdim=True)
+            return w * x * torch.rsqrt(v + eps)
+
+        x = torch.rand(128, 4096, device=GPU_TYPE, dtype=torch.bfloat16)
+        w = torch.rand(4096, device=GPU_TYPE, dtype=torch.bfloat16)
+        with fresh_cache():
+            _, codes = run_and_get_code(torch.compile(rms_norm, fullgraph=True), x, w)
+
+        FileCheck().check(
+            "'register_tiled_persistent_reduction_candidate': True"
+        ).check("'register_tiled_persistent_reduction_shared_reads'").run(codes[0])
 
     @requires_gpu_and_triton
     def test_combo_rms_norm_forwards_add_persistent_rblock(self):

@@ -433,6 +433,14 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             if override_persistent_reduction is not None
             else self.should_use_persistent_reduction()
         )
+        self.register_tiled_persistent_reduction_candidate: bool = (
+            self.should_use_register_tiled_persistent_reduction()
+        )
+        # The source-retained tiled replay codegen is landed behind this
+        # candidate bit in a follow-up patch.  Keep current behavior unchanged
+        # until codegen can prove it forwards epilogue source loads instead of
+        # emitting a second global input load.
+        self.register_tiled_persistent_reduction: bool = False
         self.mix_order_reduction: bool = mix_order_reduction
         self.no_x_dim = self.want_no_x_dim()
         self.code_hash: str | None = None
@@ -603,6 +611,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return False  # defined in subclass
 
     def should_use_persistent_reduction(self) -> bool:
+        return False  # defined in subclass
+
+    def should_use_register_tiled_persistent_reduction(self) -> bool:
         return False  # defined in subclass
 
     def var_ranges(self) -> dict[sympy.Symbol, sympy.Expr]:
