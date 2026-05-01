@@ -1108,6 +1108,13 @@ class TritonCSEVariable(CSEVariable):
         super().__init__(name, bounds, dtype, shape=shape)
         # We'll use this to track which masks the variable needs when used for indirect indexing
         self.mask_vars: OrderedSet[str] = OrderedSet()
+        # Source-load metadata used by source-retained tiled reductions and
+        # low-precision peepholes.  A variable may have dtype fp32 because
+        # Inductor upcasted the load for computation, while source_dtype records
+        # the original memory dtype (for example bf16).
+        self.source_dtype: torch.dtype | None = None
+        self.source_buffer: str | None = None
+        self.source_index: sympy.Expr | None = None
         assert dtype is not None, "TritonCSEVariable must have dtype"
         assert shape is not None, "TritonCSEVariable must have shape"
 
@@ -1123,6 +1130,11 @@ class TritonCSEVariable(CSEVariable):
                     if symbol_is_type(arg, symt):
                         self.mask_vars.update([f"{prefix_str[symt]}mask"])
                         break
+
+        if name == "to_dtype" and args and isinstance(args[0], TritonCSEVariable):
+            self.source_dtype = args[0].source_dtype
+            self.source_buffer = args[0].source_buffer
+            self.source_index = args[0].source_index
 
 
 def get_dtype_handler() -> DtypePropagationOpsHandler:
@@ -1323,6 +1335,38 @@ class TritonOverrides(OpOverrides):
                 out = f"{out}.to({triton_type(out_dtype)})"
 
         return out
+
+    @staticmethod
+    def _can_use_bf16_fma_on_sm100(x, y) -> bool:
+        if not config.triton.use_bf16_fma_on_sm100 or torch.version.hip:
+            return False
+
+        device = V.graph.get_current_device_or_throw()
+        props = DeviceProperties.create(device)
+        if props.major is None or props.major < 10:
+            return False
+
+        def is_fp32_from_bf16_load(value) -> bool:
+            return (
+                isinstance(value, TritonCSEVariable)
+                and value.dtype == torch.float32
+                and value.source_dtype == torch.bfloat16
+                and value.source_buffer is not None
+            )
+
+        return is_fp32_from_bf16_load(x) and is_fp32_from_bf16_load(y)
+
+    @staticmethod
+    def mul(x, y):
+        if TritonOverrides._can_use_bf16_fma_on_sm100(x, y):
+            return (
+                "tl.inline_asm_elementwise("
+                "'fma.rn.f32.bf16 $0, $1, $2, 0f00000000;', "
+                "'=r,h,h', "
+                f"[{x}.to(tl.bfloat16), {y}.to(tl.bfloat16)], "
+                "dtype=tl.float32, is_pure=True, pack=1)"
+            )
+        return f"{TritonOverrides.paren(x)} * {TritonOverrides.paren(y)}"
 
     @staticmethod
     def div_rn(x, y):
@@ -3782,6 +3826,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         indirect_indexing = self.is_indirect_indexing(index)
         original_index = index
         dtype = V.graph.get_dtype(name)
+        source_dtype = dtype
         indexing = self.indexing(
             index,
             block_ptr=True,
@@ -3934,12 +3979,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             load_counts[name] -= 1  # don't double count cache hit
         assert isinstance(result_var, TritonCSEVariable)
         result_var.mask_vars = indexing.mask_vars  # type: ignore[assignment]
+        result_var.source_dtype = source_dtype
+        result_var.source_buffer = name
+        result_var.source_index = original_index
 
         if append_broadcast:
             line = f"tl.broadcast_to({result_var}, {append_broadcast})"
+            source_var = result_var
             result_var = self.cse.generate(
                 load_buffer, line, dtype=dtype, shape=indexing.expand_shape
             )
+            assert isinstance(result_var, TritonCSEVariable)
+            result_var.source_dtype = source_var.source_dtype
+            result_var.source_buffer = source_var.source_buffer
+            result_var.source_index = source_var.source_index
             if indexing.mask_vars:
                 if dtype.is_floating_point:
                     zero = "0.0"
@@ -3951,9 +4004,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     constant_repr(self._load_other) if self._load_other else zero
                 )
                 line = f"tl.where({indexing.mask_str}, {result_var}, {other_val})"
+                source_var = result_var
                 result_var = self.cse.generate(
                     load_buffer, line, dtype=dtype, shape=result_var.shape
                 )
+                assert isinstance(result_var, TritonCSEVariable)
+                result_var.source_dtype = source_var.source_dtype
+                result_var.source_buffer = source_var.source_buffer
+                result_var.source_index = source_var.source_index
 
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
             self.outside_loop_vars.add(result_var)

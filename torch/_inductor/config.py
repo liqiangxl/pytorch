@@ -2011,6 +2011,13 @@ class triton:
     # Whether to upcast float16 / bfloat16 to float32 in triton codegen (Experimental)
     codegen_upcast_to_fp32 = True
 
+    # Experimental: on SM100+, use fma.rn.f32.bf16 for multiplications whose
+    # operands originate from bf16 memory loads.  This preserves fp32 product
+    # precision while avoiding LLVM's tendency to miss the Blackwell FHFMA form.
+    use_bf16_fma_on_sm100 = (
+        os.environ.get("TORCHINDUCTOR_USE_BF16_FMA_ON_SM100", "0") == "1"
+    )
+
     # Whether persistent matmul kernels should be enabled. On NVIDIA H100+ with TMA support,
     # this enables TMA persistent kernels. On AMD GPUs without TMA, this enables
     # non-TMA persistent kernels as a fallback.

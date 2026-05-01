@@ -12,7 +12,7 @@ import torch
 import torch._inductor
 from torch._inductor.utils import fresh_cache, run_and_get_code
 from torch.testing import FileCheck
-from torch.testing._internal.common_cuda import SM90OrLater
+from torch.testing._internal.common_cuda import SM100OrLater, SM90OrLater
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -1884,6 +1884,25 @@ class ComboKernelMetadataTests(TestCase):
         FileCheck().check(
             "'register_tiled_persistent_reduction_candidate': True"
         ).check("'register_tiled_persistent_reduction_shared_reads'").run(codes[0])
+
+    @requires_cuda_and_triton
+    @unittest.skipIf(not SM100OrLater, "bf16 FHFMA requires SM100+")
+    @torch._inductor.config.patch({"triton.use_bf16_fma_on_sm100": True})
+    def test_bf16_source_mul_uses_fhfma_on_sm100(self):
+        def rms_norm(x, w, eps=1e-6):
+            v = x.pow(2).mean(-1, keepdim=True)
+            return w * x * torch.rsqrt(v + eps)
+
+        x = torch.rand(128, 4096, device=GPU_TYPE, dtype=torch.bfloat16)
+        w = torch.rand(4096, device=GPU_TYPE, dtype=torch.bfloat16)
+        with fresh_cache():
+            actual, codes = run_and_get_code(
+                torch.compile(rms_norm, fullgraph=True), x, w
+            )
+
+        expected = rms_norm(x, w)
+        torch.testing.assert_close(actual, expected)
+        FileCheck().check("fma.rn.f32.bf16").run(codes[0])
 
     @requires_gpu_and_triton
     def test_combo_rms_norm_forwards_add_persistent_rblock(self):
