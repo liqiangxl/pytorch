@@ -4088,6 +4088,23 @@ def reduction(
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
+    tile_size = inductor_meta.get("register_tiled_persistent_reduction_tile_size")
+    if tile_size is not None and inductor_meta.get("register_tiled_persistent_reduction"):
+        clamped = []
+        for c in configs:
+            kw = dict(c.kwargs)
+            for k in list(kw):
+                if k.startswith("R") and k.endswith("BLOCK"):
+                    kw[k] = tile_size
+            clamped.append(Config(kw, num_warps=c.num_warps, num_stages=c.num_stages))
+        seen: set[tuple[Any, ...]] = set()
+        configs = []
+        for c in clamped:
+            key = (tuple(sorted(c.kwargs.items())), c.num_warps, c.num_stages)
+            if key not in seen:
+                seen.add(key)
+                configs.append(c)
+
     if return_configs:
         return configs
 

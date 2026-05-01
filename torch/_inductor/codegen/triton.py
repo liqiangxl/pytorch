@@ -2786,6 +2786,42 @@ class TMACompatibilityChecker:
         return self.force
 
 
+@dataclasses.dataclass
+class _TiledReductionAccumulator:
+    result_var: TritonCSEVariable
+    accumulator: TritonCSEVariable
+
+
+@dataclasses.dataclass
+class _TiledContext:
+    """State for register-tiled persistent reduction codegen."""
+
+    schedule: Any  # TiledReductionSchedule
+    phase: str = "reduction"
+    tile: int = 0
+    retained: dict[tuple[int, str], TritonCSEVariable] = dataclasses.field(
+        default_factory=dict
+    )
+    accumulators: dict[tuple[str, int], _TiledReductionAccumulator] = (
+        dataclasses.field(default_factory=dict)
+    )
+    reduction_ordinals: collections.defaultdict[str, int] = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(int)
+    )
+
+    def begin_tile(self, phase: str, tile: int) -> None:
+        self.phase = phase
+        self.tile = tile
+        self.reduction_ordinals.clear()
+
+    def next_reduction_key(
+        self, node_name: str
+    ) -> tuple[str, int]:
+        ordinal = self.reduction_ordinals[node_name]
+        self.reduction_ordinals[node_name] += 1
+        return node_name, ordinal
+
+
 class TritonKernel(SIMDKernel[TritonCSEVariable]):
     """A class to represent a triton kernel and helpers to generate
     triton kernel programmatically
@@ -2832,6 +2868,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
         self.tma_min_block_sizes = dict[str, int]()
         self.hint_override = hint_override
+        self._tiled_ctx: _TiledContext | None = None
+        self.register_tiled_persistent_reduction: bool = (
+            self._should_use_register_tiled()
+        )
         self._load_counts: collections.Counter[str] = collections.Counter()
         self._pdl_load_index = 0
         self._pdl_has_wait = False
@@ -3766,6 +3806,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         Load from the memory location 'name', offset by some indexing expression 'index'.
         """
+        ctx = self._tiled_ctx
+        if ctx is not None and ctx.phase == "epilogue" and name in ctx.schedule.shared_read_names:
+            retained = ctx.retained.get((ctx.tile, name))
+            if retained is not None:
+                retained.use_count += 1
+                return retained
+            raise AssertionError(
+                f"register-tiled epilogue could not forward retained load for {name}"
+            )
+
         var = self.args.input(name)
         load_counts = self._load_counts
         load_counts[name] += 1
@@ -3948,6 +3998,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
             self.outside_loop_vars.add(result_var)
+
+        ctx = self._tiled_ctx
+        if ctx is not None and ctx.phase == "reduction" and name in ctx.schedule.shared_read_names:
+            ctx.retained[(ctx.tile, name)] = result_var
 
         return result_var
 
@@ -4330,6 +4384,23 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 return tval
             return TritonKernelOverrides.where(cond, tval, fval)
 
+        # Register-tiled persistent reduction: reuse accumulator across tiles
+        ctx = self._tiled_ctx
+        _tiled_rkey = None
+        if ctx is not None and ctx.phase == "reduction":
+            node_name = V.kernel.current_node.get_name() if V.kernel.current_node else "<unknown>"
+            _tiled_rkey = ctx.next_reduction_key(node_name)
+            existing = ctx.accumulators.get(_tiled_rkey)
+            if existing is not None:
+                combine_fn = ir.get_reduction_combine_fn(reduction_type, src_dtype)
+                updated = combine_fn(existing.accumulator, value)
+                self.compute.writeline(
+                    f"{existing.accumulator} = {where_cond(updated, existing.accumulator)}"
+                )
+                self.outside_loop_vars.add(existing.result_var)
+                self.cse.reduction_cache[cache_key] = existing.result_var
+                return existing.result_var
+
         if self.persistent_reduction:
             default = ir.Reduction.default_value(reduction_type, src_dtype)
 
@@ -4555,6 +4626,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
                 final_reduction_define(
                     self.post_loop_combine, result_var, accumulator, None
+                )
+
+            # Register accumulator for tiled reduction reuse on tile > 0
+            if _tiled_rkey is not None:
+                ctx.accumulators[_tiled_rkey] = _TiledReductionAccumulator(
+                    result_var=result_var,
+                    accumulator=accumulator,
                 )
 
         if self.cooperative_reduction:
@@ -4844,6 +4922,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         index: sympy.Expr,
         value: CSEVariable,
     ):
+        ctx = self._tiled_ctx
+        if ctx is not None and ctx.phase == "reduction" and ctx.tile > 0:
+            self.num_store -= 1
+            return
+
         assert self.inside_reduction
         self.inside_reduction = False
         dtype = V.graph.get_dtype(name)
@@ -5177,6 +5260,96 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         code.splice(self.prologue)
         self.prologue.clear()
         self.prologue_cache.clear()
+
+    def _should_use_register_tiled(self) -> bool:
+        from ..runtime.hints import ReductionHint
+
+        if self.persistent_reduction:
+            return False
+        if self.cooperative_reduction:
+            return False
+        if not self.features.is_reduction():
+            return False
+        hint = self.features.get_reduction_hint()
+        if hint != ReductionHint.INNER:
+            return False
+        if torch.version.hip:
+            return False
+        return self.features.tiled_reduction_schedule() is not None
+
+    def begin_tiled_reduction(self, schedule) -> bool:
+        """Validate and set up tiled reduction context. Returns False to fall back."""
+        loop_trees = [tree for tree in self.range_trees if tree.is_loop]
+        if len(loop_trees) != 1:
+            self.register_tiled_persistent_reduction = False
+            return False
+        loop_tree = loop_trees[0]
+        if self.pointer_advancements.get(loop_tree.symt):
+            self.register_tiled_persistent_reduction = False
+            return False
+
+        unsupported = {
+            "argmax", "argmin", "dot", "online_softmax_reduce",
+            "welford_reduce", "welford_combine",
+        }
+        for node in schedule.reduction_nodes:
+            snodes = getattr(node, "snodes", (node,))
+            for snode in snodes:
+                rtype = snode.node.get_reduction_type()
+                if rtype in unsupported:
+                    self.register_tiled_persistent_reduction = False
+                    return False
+
+        self._tiled_ctx = _TiledContext(schedule=schedule)
+        return True
+
+    def begin_tile(self, phase: str, tile: int) -> None:
+        ctx = self._tiled_ctx
+        assert ctx is not None
+        ctx.begin_tile(phase, tile)
+        self.inside_reduction = True
+
+        loop_trees = [tree for tree in self.range_trees if tree.is_loop]
+        assert len(loop_trees) == 1
+        tree = loop_trees[0]
+
+        self.body.writeline(f"{tree.prefix}offset = {tile * ctx.schedule.tile_size}")
+        self.iteration_ranges_codegen_header(tree, self.body)
+        self.codegen_reduction_indices(self.body)
+
+    def end_tile(self) -> None:
+        ctx = self._tiled_ctx
+        assert ctx is not None
+        self.body.splice(self.indexing_code)
+        self.body.splice(self.loads)
+        self.body.splice(self.compute)
+        self.body.splice(self.stores)
+        self.indexing_code.clear()
+        self.loads.clear()
+        self.compute.clear()
+        self.stores.clear()
+        self.cse.invalidate(self.outside_loop_vars)
+        loop_trees = [tree for tree in self.range_trees if tree.is_loop]
+        for tree in loop_trees:
+            tree.cache_clear()
+
+    def finalize_tiled_reduction(self) -> None:
+        self.body.splice(self.post_loop_combine)
+        self.body.splice(self.post_loop_store)
+        self.post_loop_combine.clear()
+        self.post_loop_store.clear()
+
+    def end_tiled_reduction(self) -> None:
+        self.indexing_code.clear()
+        self.loads.clear()
+        self.compute.clear()
+        self.stores.clear()
+        self.post_loop_combine.clear()
+        self.post_loop_store.clear()
+        ctx = self._tiled_ctx
+        self._tiled_ctx = None
+        if ctx is not None:
+            self.inside_reduction = False
 
     def codegen_body(self):
         """
@@ -5519,7 +5692,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         elif self.persistent_reduction:
             assert self.inside_reduction
             return "persistent_reduction"
-        elif self.inside_reduction:
+        elif self.inside_reduction or self.register_tiled_persistent_reduction:
             return "reduction"
         return "pointwise"
 
@@ -5651,6 +5824,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             out["persistent_reduction"] = self.persistent_reduction
         if self.add_persistent_rblock:
             out["add_persistent_rblock"] = True
+        if self.register_tiled_persistent_reduction:
+            out["dynamic_scale_rblock"] = False
+            out["register_tiled_persistent_reduction"] = True
+            out["register_tiled_persistent_reduction_tile_size"] = (
+                self._tiled_ctx.schedule.tile_size if self._tiled_ctx else
+                config.triton.register_tiled_persistent_reduction_tile_size
+            )
         if (
             config.benchmark_kernel
             or config.profile_bandwidth
@@ -5667,6 +5847,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @functools.cached_property
     def add_persistent_rblock(self) -> bool:
+        if self.register_tiled_persistent_reduction:
+            return False
         # Bail on 3d tiling, which has more complicated coalesce patterns
         looped_red = self.features.is_reduction() and not self.persistent_reduction
         tiling_scores = self.tiling_scores
@@ -5727,7 +5909,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         size_hints = {}
         for prefix, numel in self.numels.items():
-            if prefix_is_reduction(prefix) and not self.inside_reduction:
+            if prefix_is_reduction(prefix) and not self.inside_reduction and not self.register_tiled_persistent_reduction:
                 continue
 
             numel_hint = V.graph.sizevars.optimization_hint(numel)
@@ -5857,8 +6039,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
             "mutated_arg_names": mutated_args,
             "optimize_mem": optimize_mem,
-            **self.inductor_meta_per_kernel(),
             **self.inductor_meta_common(),
+            **self.inductor_meta_per_kernel(),
         }
 
         # Triton compiler includes equal_to_1 args into constants even
@@ -5901,7 +6083,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
                 @triton.jit
             """
-        elif self.inside_reduction:
+        elif self.inside_reduction or self.register_tiled_persistent_reduction:
             reduction_hint = self.features.get_reduction_hint(self.tiling_scores)
             heuristics_line = f"""
                 @triton_heuristics.{self._get_heuristic()}(
@@ -6003,7 +6185,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return isinstance(expr, (sympy.Integer, int))
 
         for tree in self.range_trees:
-            if not tree.is_reduction or self.inside_reduction:
+            if not tree.is_reduction or self.inside_reduction or self.register_tiled_persistent_reduction:
                 simplified_tree_numel = V.graph.sizevars.simplify(tree.numel)
                 if is_static_integer(simplified_tree_numel):
                     code.writeline(f"{tree.prefix}numel = {int(simplified_tree_numel)}")
@@ -6051,6 +6233,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 expr = V.graph.wrapper_code.generate_numel_expr(name, tree)
 
+            if tree.is_reduction and self.register_tiled_persistent_reduction:
+                # Static reduction numel is hardcoded in the body
+                continue
             if not tree.is_reduction or self.inside_reduction:
                 call_args.append(expr)
                 arg_types.append(type(expr))

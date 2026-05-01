@@ -2052,6 +2052,15 @@ class SIMDScheduling(BaseScheduling):
 
             kernel.finalize_indexing(all_indexing.keys())
 
+            # Try register-tiled persistent reduction path
+            tiled = (
+                kernel.features.tiled_reduction_schedule()
+                if getattr(kernel, "register_tiled_persistent_reduction", False)
+                else None
+            )
+            if tiled is not None and self.codegen_tiled_reduction(kernel, tiled):
+                return
+
             # Second pass to do codegen
             for node in node_schedule:
                 if node is DisableReduction:
@@ -2063,6 +2072,36 @@ class SIMDScheduling(BaseScheduling):
                     indexing_dtype_strength_reduction(node._body)
                     index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     node.codegen(index_vars)
+
+    def codegen_tiled_reduction(self, kernel, schedule):
+        """Drive register-tiled persistent reduction from the scheduler level.
+
+        Returns True if the tiled path was taken, False to fall back.
+        """
+        if not kernel.begin_tiled_reduction(schedule):
+            return False
+
+        for node in (*schedule.reduction_nodes, *schedule.epilogue_nodes):
+            indexing_dtype_strength_reduction(node._body)
+
+        for tile in range(schedule.num_tiles):
+            kernel.begin_tile("reduction", tile)
+            for node in schedule.reduction_nodes:
+                index_vars = kernel.split_and_set_ranges(node.get_ranges())
+                node.codegen(index_vars)
+            kernel.end_tile()
+
+        kernel.finalize_tiled_reduction()
+
+        for tile in range(schedule.num_tiles):
+            kernel.begin_tile("epilogue", tile)
+            for node in schedule.epilogue_nodes:
+                index_vars = kernel.split_and_set_ranges(node.get_ranges())
+                node.codegen(index_vars)
+            kernel.end_tile()
+
+        kernel.end_tiled_reduction()
+        return True
 
     def _codegen_single_template(
         self,
