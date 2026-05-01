@@ -1883,7 +1883,96 @@ class ComboKernelMetadataTests(TestCase):
 
         FileCheck().check(
             "'register_tiled_persistent_reduction_candidate': True"
-        ).check("'register_tiled_persistent_reduction_shared_reads'").run(codes[0])
+        ).check("'register_tiled_persistent_reduction_shared_reads'").check(
+            "'register_tiled_persistent_reduction': True"
+        ).run(codes[0])
+
+    @requires_cuda_and_triton
+    @torch._inductor.config.patch(
+        {
+            "triton.register_tiled_persistent_reductions": True,
+            "triton.register_tiled_persistent_reduction_tile_size": 4096,
+            "triton.multi_kernel": 0,
+        }
+    )
+    def test_register_tiled_persistent_reduction_retains_source_tiles(self):
+        def rms_norm(x, w, eps=1e-6):
+            v = x.pow(2).mean(-1, keepdim=True)
+            return w * x * torch.rsqrt(v + eps)
+
+        x = torch.rand(16, 8192, device=GPU_TYPE, dtype=torch.bfloat16)
+        w = torch.rand(8192, device=GPU_TYPE, dtype=torch.bfloat16)
+        with fresh_cache():
+            actual, codes = run_and_get_code(
+                torch.compile(rms_norm, fullgraph=True), x, w
+            )
+
+        expected = rms_norm(x, w)
+        torch.testing.assert_close(actual, expected)
+        code = codes[0]
+        FileCheck().check("'register_tiled_persistent_reduction': True").check(
+            "'register_tiled_persistent_reduction_tile_size': 4096"
+        ).run(code)
+        self.assertNotIn("for r0_offset in tl.range", code)
+        self.assertEqual(code.count("tl.load(in_ptr0 +"), 2)
+        self.assertIn("r0_offset = 0", code)
+        self.assertIn("r0_offset = 4096", code)
+
+    @requires_cuda_and_triton
+    @torch._inductor.config.patch(
+        {
+            "triton.register_tiled_persistent_reductions": True,
+            "triton.register_tiled_persistent_reduction_tile_size": 4096,
+            "triton.multi_kernel": 0,
+        }
+    )
+    def test_register_tiled_persistent_reduction_retains_multiple_sources(self):
+        def pair_norm(x, y, eps=1e-6):
+            v = (x * y).pow(2).mean(-1, keepdim=True)
+            return (x + y) * torch.rsqrt(v + eps)
+
+        x = torch.rand(8, 8192, device=GPU_TYPE, dtype=torch.bfloat16)
+        y = torch.rand(8, 8192, device=GPU_TYPE, dtype=torch.bfloat16)
+        with fresh_cache():
+            actual, codes = run_and_get_code(
+                torch.compile(pair_norm, fullgraph=True), x, y
+            )
+
+        expected = pair_norm(x, y)
+        torch.testing.assert_close(actual, expected)
+        code = codes[0]
+        FileCheck().check("'register_tiled_persistent_reduction_shared_reads'").check(
+            "'arg0_1'"
+        ).check("'arg1_1'").check("'register_tiled_persistent_reduction': True").run(
+            code
+        )
+        self.assertNotIn("for r0_offset in tl.range", code)
+        self.assertEqual(code.count("tl.load(in_ptr0 +"), 2)
+        self.assertEqual(code.count("tl.load(in_ptr1 +"), 2)
+        self.assertIn("r0_offset = 0", code)
+        self.assertIn("r0_offset = 4096", code)
+
+    @requires_cuda_and_triton
+    @torch._inductor.config.patch(
+        {
+            "triton.register_tiled_persistent_reductions": True,
+            "triton.register_tiled_persistent_reduction_tile_size": 4096,
+            "triton.multi_kernel": 0,
+        }
+    )
+    def test_register_tiled_persistent_reduction_unsupported_welford_falls_back(self):
+        def var_norm(x, eps=1e-6):
+            var, mean = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
+            return (x - mean) * torch.rsqrt(var + eps)
+
+        x = torch.rand(8, 8192, device=GPU_TYPE, dtype=torch.float32)
+        with fresh_cache():
+            actual, codes = run_and_get_code(torch.compile(var_norm, fullgraph=True), x)
+
+        torch.testing.assert_close(actual, var_norm(x))
+        code = "\n".join(codes)
+        self.assertIn("'register_tiled_persistent_reduction_candidate': True", code)
+        self.assertNotIn("'register_tiled_persistent_reduction': True", code)
 
     @requires_cuda_and_triton
     @unittest.skipIf(not SM100OrLater, "bf16 FHFMA requires SM100+")
@@ -1903,6 +1992,75 @@ class ComboKernelMetadataTests(TestCase):
         expected = rms_norm(x, w)
         torch.testing.assert_close(actual, expected)
         FileCheck().check("fma.rn.f32.bf16").run(codes[0])
+
+    @requires_cuda_and_triton
+    @unittest.skipIf(not SM100OrLater, "bf16 FHFMA requires SM100+")
+    @torch._inductor.config.patch(
+        {
+            "triton.register_tiled_persistent_reductions": True,
+            "triton.register_tiled_persistent_reduction_tile_size": 4096,
+            "triton.use_bf16_fma_on_sm100": True,
+            "triton.multi_kernel": 0,
+        }
+    )
+    # Performance-oriented shape: looped/two-load baseline is ~53us,
+    # retained 4-tile FHFMA is expected around ~40us on SM100.
+    def test_register_tiled_persistent_reduction_allfhfma_on_sm100(self):
+        def rms_norm(x, w, eps=1e-6):
+            v = x.pow(2).mean(-1, keepdim=True)
+            return w * x * torch.rsqrt(v + eps)
+
+        def rms_norm_ref(x, w, eps=1e-6):
+            x_fp32 = x.float()
+            return (
+                w.float()
+                * x_fp32
+                * torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + eps)
+            ).to(x.dtype)
+
+        x = torch.rand(4096, 16384, device=GPU_TYPE, dtype=torch.bfloat16)
+        w = torch.rand(16384, device=GPU_TYPE, dtype=torch.bfloat16)
+        with fresh_cache():
+            actual, codes = run_and_get_code(
+                torch.compile(rms_norm, fullgraph=True), x, w
+            )
+
+        expected = rms_norm_ref(x, w)
+        torch.testing.assert_close(actual, expected)
+        code = codes[0]
+        self.assertIn("'register_tiled_persistent_reduction': True", code)
+        self.assertIn("'dynamic_scale_rblock': False", code)
+        self.assertNotIn("for r0_offset in tl.range", code)
+        self.assertEqual(code.count("tl.load(in_ptr0 +"), 4)
+        self.assertGreaterEqual(code.count("fma.rn.f32.bf16"), 8)
+        self.assertIn("r0_offset = 12288", code)
+        lines = code.splitlines()
+        self.assertFalse(
+            any(
+                "tl.load(in_ptr0 +" in line and ".to(tl.float32)" in line
+                for line in lines
+            )
+        )
+        self.assertFalse(
+            any(
+                "tl.load(in_ptr0 +" in line
+                and "eviction_policy='evict_last'" in line
+                for line in lines
+            )
+        )
+        self.assertFalse(
+            any(
+                "tl.load(in_ptr1 +" in line and ".to(tl.float32)" in line
+                for line in lines
+            )
+        )
+        fma_vars = []
+        for line in code.splitlines():
+            if " = tl.inline_asm_elementwise(" in line and "dtype=tl.float32" in line:
+                fma_vars.append(line.split("=", 1)[0].strip())
+        for var in fma_vars:
+            self.assertNotIn(f"{var}.to(tl.float32)", code)
+        self.assertNotIn(".to(tl.bfloat16)", code)
 
     @requires_gpu_and_triton
     def test_combo_rms_norm_forwards_add_persistent_rblock(self):
