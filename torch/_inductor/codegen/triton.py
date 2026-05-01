@@ -48,6 +48,7 @@ from ..async_compile import AsyncCompile
 from ..codecache import code_hash, get_path, PyCodeCache, write_atomic
 from ..debug import set_kernel_post_grad_provenance_tracing
 from ..ops_handler import DefaultHandler
+from ..optimize_indexing import indexing_dtype_strength_reduction
 from ..runtime import triton_heuristics
 from ..runtime.benchmarking import benchmarker
 from ..runtime.hints import (
@@ -1115,6 +1116,9 @@ class TritonCSEVariable(CSEVariable):
         self.source_dtype: torch.dtype | None = None
         self.source_buffer: str | None = None
         self.source_index: sympy.Expr | None = None
+        # True when the emitted load intentionally keeps the low-precision
+        # source value while dtype metadata models the fp32 computation.
+        self.source_preserved: bool = False
         assert dtype is not None, "TritonCSEVariable must have dtype"
         assert shape is not None, "TritonCSEVariable must have shape"
 
@@ -1135,6 +1139,7 @@ class TritonCSEVariable(CSEVariable):
             self.source_dtype = args[0].source_dtype
             self.source_buffer = args[0].source_buffer
             self.source_index = args[0].source_index
+            self.source_preserved = args[0].source_preserved
 
 
 def get_dtype_handler() -> DtypePropagationOpsHandler:
@@ -1233,6 +1238,9 @@ class TritonOverrides(OpOverrides):
                 _get_min_elements_per_thread(src_dtype, dtype),
                 V.kernel.min_elem_per_thread,
             )
+
+        if dtype == torch.float32 and getattr(x, "dtype", None) == dtype:
+            return str(x)
 
         if dtype == torch.bool:
             return f"({x} != 0)"
@@ -1359,11 +1367,16 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     def mul(x, y):
         if TritonOverrides._can_use_bf16_fma_on_sm100(x, y):
+            def bf16_operand(value):
+                if getattr(value, "source_preserved", False):
+                    return str(value)
+                return f"{value}.to(tl.bfloat16)"
+
             return (
                 "tl.inline_asm_elementwise("
                 "'fma.rn.f32.bf16 $0, $1, $2, 0f00000000;', "
                 "'=r,h,h', "
-                f"[{x}.to(tl.bfloat16), {y}.to(tl.bfloat16)], "
+                f"[{bf16_operand(x)}, {bf16_operand(y)}], "
                 "dtype=tl.float32, is_pure=True, pack=1)"
             )
         return f"{TritonOverrides.paren(x)} * {TritonOverrides.paren(y)}"
@@ -2570,6 +2583,44 @@ class TritonCSE(CSE[TritonCSEVariable, str | tuple[str, str]]):
 
 
 @dataclasses.dataclass
+class RegisterTiledAccumulatorState:
+    result_var: TritonCSEVariable
+    accumulator: TritonCSEVariable
+
+
+@dataclasses.dataclass
+class RegisterTiledReplayState:
+    loop_tree: IterationRangesRoot
+    tile_size: int
+    num_tiles: int
+    shared_read_names: tuple[str, ...]
+    phase: str = "reduction"
+    tile: int = 0
+    retained_loads: dict[tuple[int, str, sympy.Expr], TritonCSEVariable] = (
+        dataclasses.field(default_factory=dict)
+    )
+    reduction_accumulators: dict[
+        tuple[str, int], RegisterTiledAccumulatorState
+    ] = dataclasses.field(default_factory=dict)
+    reduction_ordinals: collections.defaultdict[str, int] = dataclasses.field(
+        default_factory=lambda: collections.defaultdict(int)
+    )
+
+    def begin_tile(self, phase: str, tile: int) -> None:
+        self.phase = phase
+        self.tile = tile
+        self.reduction_ordinals.clear()
+
+    def next_reduction_key(
+        self, node: SchedulerNode | None
+    ) -> tuple[str, int]:
+        node_name = node.get_name() if node is not None else "<unknown>"
+        ordinal = self.reduction_ordinals[node_name]
+        self.reduction_ordinals[node_name] += 1
+        return node_name, ordinal
+
+
+@dataclasses.dataclass
 class TMACompatibilityChecker:
     """
     Checks if the TMA API can be used for load / store triton operations.
@@ -2879,6 +2930,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._load_counts: collections.Counter[str] = collections.Counter()
         self._pdl_load_index = 0
         self._pdl_has_wait = False
+        self._register_tiled_replay_state: RegisterTiledReplayState | None = None
 
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints = OrderedSet[AutotuneHint]()
@@ -3819,6 +3871,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
         Load from the memory location 'name', offset by some indexing expression 'index'.
         """
+        replay_state = self._register_tiled_replay_state
+        if (
+            replay_state is not None
+            and replay_state.phase == "epilogue"
+            and name in replay_state.shared_read_names
+        ):
+            retained = replay_state.retained_loads.get(
+                (replay_state.tile, name, V.graph.sizevars.simplify(index))
+            )
+            if retained is not None:
+                retained.use_count += 1
+                return retained
+            raise AssertionError(
+                f"register-tiled epilogue could not forward retained load for {name}"
+            )
+
         var = self.args.input(name)
         load_counts = self._load_counts
         load_counts[name] += 1
@@ -3827,6 +3895,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         original_index = index
         dtype = V.graph.get_dtype(name)
         source_dtype = dtype
+        register_tiled_retained_source = (
+            replay_state is not None
+            and replay_state.phase == "reduction"
+            and name in replay_state.shared_read_names
+        )
+        preserve_bf16_source = (
+            replay_state is not None
+            and source_dtype == torch.bfloat16
+            and config.triton.use_bf16_fma_on_sm100
+            and not torch.version.hip
+        )
+        if preserve_bf16_source:
+            device = V.graph.get_current_device_or_throw()
+            props = DeviceProperties.create(device)
+            preserve_bf16_source = props.major is not None and props.major >= 10
         indexing = self.indexing(
             index,
             block_ptr=True,
@@ -3877,6 +3960,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             make_line = functools.partial(DelayReplaceLine, "<EP>", decide_later)
         else:
             ep = ""
+        if register_tiled_retained_source:
+            ep = ""
+            make_line = identity
 
         if (has_tmpmask or has_rindex) and indexing.has_mask():
             if self._load_other:
@@ -3960,7 +4046,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 dtype in (torch.float16, torch.bfloat16)
                 and config.triton.codegen_upcast_to_fp32
             ):
-                line += ".to(tl.float32)"
+                if preserve_bf16_source:
+                    # Keep the source value in its compact bf16 register for
+                    # source-retained replay.  The CSE dtype remains fp32 so
+                    # dtype propagation continues to model the computation
+                    # result while FHFMA lowering consumes the preserved source.
+                    pass
+                else:
+                    line += ".to(tl.float32)"
                 dtype = torch.float32
             if dtype == torch.bool and torch.version.hip is None:
                 # Workaround for https://github.com/triton-lang/triton/issues/2151
@@ -3982,6 +4075,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         result_var.source_dtype = source_dtype
         result_var.source_buffer = name
         result_var.source_index = original_index
+        result_var.source_preserved = preserve_bf16_source
+        if register_tiled_retained_source:
+            replay_state.retained_loads[
+                (replay_state.tile, name, V.graph.sizevars.simplify(original_index))
+            ] = result_var
 
         if append_broadcast:
             line = f"tl.broadcast_to({result_var}, {append_broadcast})"
@@ -3993,6 +4091,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             result_var.source_dtype = source_var.source_dtype
             result_var.source_buffer = source_var.source_buffer
             result_var.source_index = source_var.source_index
+            result_var.source_preserved = source_var.source_preserved
             if indexing.mask_vars:
                 if dtype.is_floating_point:
                     zero = "0.0"
@@ -4012,6 +4111,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 result_var.source_dtype = source_var.source_dtype
                 result_var.source_buffer = source_var.source_buffer
                 result_var.source_index = source_var.source_index
+                result_var.source_preserved = source_var.source_preserved
+
+            if register_tiled_retained_source:
+                replay_state.retained_loads[
+                    (
+                        replay_state.tile,
+                        name,
+                        V.graph.sizevars.simplify(original_index),
+                    )
+                ] = result_var
 
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
             self.outside_loop_vars.add(result_var)
@@ -4396,6 +4505,64 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if not cond:
                 return tval
             return TritonKernelOverrides.where(cond, tval, fval)
+
+        replay_state = self._register_tiled_replay_state
+        if replay_state is not None and replay_state.phase == "reduction":
+            if (
+                isinstance(value, tuple)
+                or reduction_type
+                in (
+                    "argmax",
+                    "argmin",
+                    "dot",
+                    "online_softmax_reduce",
+                    "welford_reduce",
+                    "welford_combine",
+                )
+                or src_dtype == torch.bool
+            ):
+                raise AssertionError(
+                    f"register-tiled replay does not support {reduction_type}"
+                )
+
+            replay_key = replay_state.next_reduction_key(self.current_node)
+            accumulator_state = replay_state.reduction_accumulators.get(replay_key)
+            if accumulator_state is None:
+                accumulator = self.cse.namedvar(
+                    f"_{result_var}",
+                    dtype=torch_acc_type,
+                    shape=tuple(self.dense_size_list()),
+                )
+                default = ir.Reduction.default_accumulator(reduction_type, src_dtype)
+                default = self._map_tuple_or_scalar(constant_repr, default)
+                assert not isinstance(default, tuple)
+                self.body.writeline(
+                    f"{accumulator} = tl.full({self.dense_size_str()}, {default}, {acc_type})"
+                )
+                assert isinstance(result_var, TritonCSEVariable)
+                accumulator_state = RegisterTiledAccumulatorState(
+                    result_var=result_var,
+                    accumulator=accumulator,
+                )
+                replay_state.reduction_accumulators[replay_key] = accumulator_state
+                final_reduction_define(
+                    self.post_loop_combine, result_var, accumulator, None
+                )
+                if do_upcast and result_var.dtype != original_dtype:
+                    self.post_loop_combine.writeline(
+                        f"{result_var} = {result_var}.to({triton_compute_type(original_dtype)})"
+                    )
+            else:
+                result_var = accumulator_state.result_var
+                accumulator = accumulator_state.accumulator
+
+            assert isinstance(value, CSEVariable)
+            combine_fn = ir.get_reduction_combine_fn(reduction_type, src_dtype)
+            updated = combine_fn(accumulator, value)
+            self.compute.writeline(f"{accumulator} = {where_cond(updated, accumulator)}")
+            self.cse.reduction_cache[cache_key] = result_var
+            self.outside_loop_vars.add(result_var)
+            return result_var
 
         if self.persistent_reduction:
             default = ir.Reduction.default_value(reduction_type, src_dtype)
@@ -4911,6 +5078,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         index: sympy.Expr,
         value: CSEVariable,
     ):
+        replay_state = self._register_tiled_replay_state
+        if (
+            replay_state is not None
+            and replay_state.phase == "reduction"
+            and replay_state.tile > 0
+        ):
+            self.num_store -= 1
+            return
+
         assert self.inside_reduction
         self.inside_reduction = False
         dtype = V.graph.get_dtype(name)
@@ -5244,6 +5420,152 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         code.splice(self.prologue)
         self.prologue.clear()
         self.prologue_cache.clear()
+
+    def _register_tiled_static_rnumel(
+        self, loop_tree: IterationRangesRoot
+    ) -> int | None:
+        for expr in (loop_tree.numel, self.features.reduction_numel):
+            simplified = V.graph.sizevars.simplify(expr)
+            if isinstance(simplified, (sympy.Integer, int)):
+                return int(simplified)
+        return None
+
+    def _register_tiled_iteration_header(
+        self, state: RegisterTiledReplayState, tile: int
+    ) -> IndentedBuffer:
+        header = IndentedBuffer()
+        tree = state.loop_tree
+        header.writeline(f"{tree.prefix}offset = {tile * state.tile_size}")
+        self.iteration_ranges_codegen_header(tree, header)
+        self.codegen_reduction_indices(header)
+        return header
+
+    def _register_tiled_replay_state_for_codegen(
+        self,
+    ) -> RegisterTiledReplayState | None:
+        if self.cooperative_reduction or self.mix_order_reduction:
+            self.register_tiled_persistent_reduction = False
+            return None
+        if self.features.reduction_and_epilogue_nodes() is None:
+            self.register_tiled_persistent_reduction = False
+            return None
+
+        loop_trees = [tree for tree in self.range_trees if tree.is_loop]
+        if len(loop_trees) != 1:
+            self.register_tiled_persistent_reduction = False
+            return None
+        loop_tree = loop_trees[0]
+        if self.pointer_advancements[loop_tree.symt]:
+            self.register_tiled_persistent_reduction = False
+            return None
+
+        rnumel = self._register_tiled_static_rnumel(loop_tree)
+        tile_size = max(config.triton.register_tiled_persistent_reduction_tile_size, 1)
+        max_tiles = max(config.triton.register_tiled_persistent_reduction_max_tiles, 1)
+        if rnumel is None or rnumel % tile_size != 0:
+            self.register_tiled_persistent_reduction = False
+            return None
+        num_tiles = rnumel // tile_size
+        if num_tiles < 1 or num_tiles > max_tiles:
+            self.register_tiled_persistent_reduction = False
+            return None
+
+        shared_read_names = self.features.reduction_epilogue_shared_read_names()
+        if not shared_read_names:
+            self.register_tiled_persistent_reduction = False
+            return None
+
+        unsupported_reductions = {
+            "argmax",
+            "argmin",
+            "dot",
+            "online_softmax_reduce",
+            "welford_reduce",
+            "welford_combine",
+        }
+        reduction_nodes, _ = self.features.reduction_and_epilogue_nodes() or ((), ())
+        for node in reduction_nodes:
+            snodes = getattr(node, "snodes", (node,))
+            for snode in snodes:
+                reduction_type = snode.node.get_reduction_type()
+                if reduction_type in unsupported_reductions:
+                    self.register_tiled_persistent_reduction = False
+                    return None
+
+        return RegisterTiledReplayState(
+            loop_tree=loop_tree,
+            tile_size=tile_size,
+            num_tiles=num_tiles,
+            shared_read_names=shared_read_names,
+        )
+
+    def _codegen_register_tiled_nodes(
+        self, nodes: tuple[SchedulerNode, ...]
+    ) -> None:
+        for node in nodes:
+            index_vars = self.split_and_set_ranges(node.get_ranges())
+            node.codegen(index_vars)
+
+    def _flush_register_tiled_tile_buffers(self, loop_tree: IterationRangesRoot) -> None:
+        self.body.splice(self.indexing_code)
+        self.body.splice(self.loads)
+        self.body.splice(self.compute)
+        self.body.splice(self.stores)
+        self.indexing_code.clear()
+        self.loads.clear()
+        self.compute.clear()
+        self.stores.clear()
+        self.cse.invalidate(self.outside_loop_vars)
+        loop_tree.cache_clear()
+
+    def codegen_register_tiled_node_schedule(self) -> bool:
+        if not self.register_tiled_persistent_reduction:
+            return False
+        segments = self.features.reduction_and_epilogue_nodes()
+        state = self._register_tiled_replay_state_for_codegen()
+        if segments is None or state is None:
+            return False
+        reduction_nodes, epilogue_nodes = segments
+        if not reduction_nodes or not epilogue_nodes:
+            self.register_tiled_persistent_reduction = False
+            return False
+
+        for node in (*reduction_nodes, *epilogue_nodes):
+            indexing_dtype_strength_reduction(node._body)
+
+        prior_inside_reduction = self.inside_reduction
+        prior_replay_state = self._register_tiled_replay_state
+        self._register_tiled_replay_state = state
+        try:
+            for tile in range(state.num_tiles):
+                state.begin_tile("reduction", tile)
+                self.inside_reduction = True
+                self.body.splice(self._register_tiled_iteration_header(state, tile))
+                self._codegen_register_tiled_nodes(reduction_nodes)
+                self._flush_register_tiled_tile_buffers(state.loop_tree)
+
+            self.body.splice(self.post_loop_combine)
+            self.body.splice(self.post_loop_store)
+            self.post_loop_combine.clear()
+            self.post_loop_store.clear()
+
+            for tile in range(state.num_tiles):
+                state.begin_tile("epilogue", tile)
+                self.inside_reduction = True
+                self.body.splice(self._register_tiled_iteration_header(state, tile))
+                self._codegen_register_tiled_nodes(epilogue_nodes)
+                self._flush_register_tiled_tile_buffers(state.loop_tree)
+        finally:
+            self.inside_reduction = prior_inside_reduction
+            self._register_tiled_replay_state = prior_replay_state
+
+        self.indexing_code.clear()
+        self.loads.clear()
+        self.compute.clear()
+        self.stores.clear()
+        self.post_loop_combine.clear()
+        self.post_loop_store.clear()
+        return True
 
     def codegen_body(self):
         """
@@ -5723,6 +6045,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             out["register_tiled_persistent_reduction_shared_reads"] = (
                 self.features.reduction_epilogue_shared_read_names()
             )
+        if self.register_tiled_persistent_reduction:
+            out["register_tiled_persistent_reduction"] = True
+            out["register_tiled_persistent_reduction_tile_size"] = max(
+                config.triton.register_tiled_persistent_reduction_tile_size, 1
+            )
         if (
             config.benchmark_kernel
             or config.profile_bandwidth
@@ -5739,6 +6066,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @functools.cached_property
     def add_persistent_rblock(self) -> bool:
+        if self.register_tiled_persistent_reduction:
+            return False
         # Bail on 3d tiling, which has more complicated coalesce patterns
         looped_red = self.features.is_reduction() and not self.persistent_reduction
         tiling_scores = self.tiling_scores
@@ -5932,6 +6261,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             **self.inductor_meta_per_kernel(),
             **self.inductor_meta_common(),
         }
+        if self.register_tiled_persistent_reduction:
+            # The replayed source assumes R0_BLOCK exactly matches the retained
+            # tile size.  Runtime R-block scaling would skip or overlap columns.
+            inductor_meta["dynamic_scale_rblock"] = False
 
         # Triton compiler includes equal_to_1 args into constants even
         # when they are not constexpr. otherwise there may be a segfault

@@ -774,6 +774,10 @@ class ComboKernel(Kernel):
             "optimize_mem": V.graph.is_inference or V.graph.is_backward,
             **self.triton_kernel_cls.inductor_meta_common(),
         }
+        if any(sub.register_tiled_persistent_reduction for sub in self.sub_kernels):
+            # Register-tiled replay bakes tile offsets into the generated source;
+            # the runtime must not shrink R0_BLOCK independently afterwards.
+            inductor_meta["dynamic_scale_rblock"] = False
         if max_persistent_rblock > 0:
             inductor_meta["max_persistent_rblock"] = max_persistent_rblock
 

@@ -3716,6 +3716,19 @@ def _reduction_configs(
                 reduction_hint=reduction_hint,
             )
 
+    if inductor_meta.get("register_tiled_persistent_reduction"):
+        tile_size = int(
+            inductor_meta.get("register_tiled_persistent_reduction_tile_size", rnumel)
+        )
+        return [
+            make_config(
+                2 if rnumel <= 2048 else 1,
+                min(rnumel, tile_size),
+                register_intensive=register_intensive,
+                dynamic_scale_rblock=False,
+            )
+        ]
+
     def outer_config_opt():
         # Default to 64 for vectorized loads
         max_x_block, x_block = 256, 64
