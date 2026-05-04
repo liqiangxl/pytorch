@@ -5338,6 +5338,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # autotuner can vary NUM_TILES.  Unused tiles are dead-code-
             # eliminated by the compiler since tl.static_range unrolls.
             max_tiles = self.persistent_max_tiles
+            assert self.num_persistent_tiles <= max_tiles, (
+                f"num_persistent_tiles ({self.num_persistent_tiles}) exceeds "
+                f"max_tiles ({max_tiles})"
+            )
+            self.body.writeline(
+                f"tl.static_assert(NUM_TILES <= {max_tiles}, "
+                f"'NUM_TILES must be <= {max_tiles}')"
+            )
 
             if self._persistent_tile_phase == "reduction":
                 for name in self.persistent_shared_read_names:
