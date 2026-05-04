@@ -4405,9 +4405,10 @@ def persistent_reduction(
     # unused tiles when NUM_TILES < max_tiles.
     rnumel = inductor_meta.get("persistent_reduction_rnumel")
     max_tiles = inductor_meta.get("persistent_reduction_max_tiles", 1)
+    min_tiles = inductor_meta.get("persistent_reduction_min_tiles", 2)
     if rnumel is not None and max_tiles > 1:
         tile_pairs = []
-        for nt in range(1, max_tiles + 1):
+        for nt in range(min_tiles, max_tiles + 1):
             ts = rnumel // nt
             if ts * nt == rnumel and ts >= 1024 and (ts & (ts - 1)) == 0:
                 tile_pairs.append((ts, nt))
@@ -4420,10 +4421,13 @@ def persistent_reduction(
             expanded = []
             for c in configs:
                 for ts, nt in tile_pairs:
-                    kw = dict(c.kwargs)
-                    kw["R0_BLOCK"] = ts
-                    kw["NUM_TILES"] = nt
-                    expanded.append(Config(kw, num_warps=c.num_warps, num_stages=c.num_stages))
+                    # With tiling, R0_BLOCK is smaller so fewer warps may
+                    # be optimal.  Generate configs with varied num_warps.
+                    for nw in (4, 8, c.num_warps):
+                        kw = dict(c.kwargs)
+                        kw["R0_BLOCK"] = ts
+                        kw["NUM_TILES"] = nt
+                        expanded.append(Config(kw, num_warps=nw, num_stages=c.num_stages))
             configs = unique_configs(expanded)
 
     if return_configs:

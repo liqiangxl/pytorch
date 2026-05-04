@@ -1924,6 +1924,11 @@ class triton:
             "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_NUMEL", "2049"
         )
     )
+    register_tiled_persistent_reduction_min_tiles: int = int(
+        os.environ.get(
+            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_TILES", "2"
+        )
+    )
 
     # Decompose sort-based ops (sort, mode, median) to generate Triton
     # kernels instead of falling back to ATen eager.  When enabled, sort

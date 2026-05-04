@@ -5834,6 +5834,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             out["persistent_reduction_num_tiles"] = self.num_persistent_tiles
             out["persistent_reduction_tile_size"] = self.persistent_tile_size
             out["persistent_reduction_max_tiles"] = self.persistent_max_tiles
+            out["persistent_reduction_min_tiles"] = (
+                config.triton.register_tiled_persistent_reduction_min_tiles
+            )
             out["persistent_reduction_rnumel"] = self.persistent_rnumel
         if (
             config.benchmark_kernel
