@@ -2970,6 +2970,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         for tree in self.range_trees:
             # reduction indexing goes inside a loop
             if not tree.is_loop:
+                # Multi-tile persistent: reduction range headers are emitted
+                # per tile by set_persistent_tile, not here.
+                if tree.is_reduction and self.num_persistent_tiles > 1:
+                    continue
                 self.iteration_ranges_codegen_header(tree, self.body)
             elif self.inside_reduction:
                 # workaround for this issue:
@@ -2986,6 +2990,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
                 rbase = self._flatten_reduction_indices(rn_bases)
                 self.body.splice(f"rbase = {self.index_to_str(rbase)}")
+            elif self.num_persistent_tiles > 1:
+                pass  # emitted per tile by set_persistent_tile
             else:
                 # For looped reductions, indexing is deferred to the innermost loop.
                 self.codegen_reduction_indices(self.body)
@@ -4370,7 +4376,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.cse.reduction_cache[cache_key] = existing_result_var
                 return existing_result_var
 
-        if self.persistent_reduction:
+        if self.persistent_reduction and self.num_persistent_tiles <= 1:
             default = ir.Reduction.default_value(reduction_type, src_dtype)
 
             def update_constant_dtype(constant, src_dtype, dst_dtype):
@@ -5276,15 +5282,24 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # allowing the same (node_name, ordinal) key to match across tiles.
         self._reduction_ordinals.clear()
 
-        # Emit a static tile offset so each tile addresses a disjoint slice of
-        # the reduction dimension (e.g. r0_offset = 0, 4096, 8192, ...).
+        # Emit a static tile offset and recompute the reduction range variables.
+        # We bypass iteration_ranges_codegen_header because it emits r0_offset = 0
+        # for persistent reductions — here we need the tile-specific offset.
         assert self.persistent_tile_size is not None
-        self.body.writeline(f"r0_offset = {tile * self.persistent_tile_size}")
-        # Regenerate the reduction range header (r0_index, r0_mask, etc.) using
-        # the new r0_offset so subsequent loads and stores index correctly.
+        tile_offset = tile * self.persistent_tile_size
         for tree in self.range_trees:
-            if tree.is_reduction:
-                self.iteration_ranges_codegen_header(tree, self.body)
+            if not tree.is_reduction:
+                continue
+            x = tree.prefix
+            self.body.writeline(f"{x}offset = {tile_offset}")
+            self.body.writeline(
+                f"{tree.name} = {x}offset + {self.iteration_ranges_ranges_code(tree)}"
+            )
+            if self._has_constant_mask(tree):
+                self.body.writeline(self.create_constant_mask(tree))
+            else:
+                self.body.writeline(f"{x}mask = {tree.name} < {x}numel")
+            tree.cache_clear()
         self.codegen_reduction_indices(self.body)
 
     def flush_persistent_tile(self) -> None:
@@ -6191,6 +6206,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 if self.cooperative_reduction:
                     numel = self.kexpr(self.rename_indexing(tree.numel))
                     val = f"triton_helpers.constexpr_next_power_of_2(({numel} + RSPLIT - 1) // RSPLIT)"
+                elif self.num_persistent_tiles > 1:
+                    val = self.persistent_tile_size
                 else:
                     val = self._get_persistent_RBLOCK(tree.numel)
                     if self.is_native_matmul:
