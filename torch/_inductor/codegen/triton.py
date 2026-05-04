@@ -3860,6 +3860,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         NOTE: enabled with env variable TORCHINDUCTOR_SKIP_L1
         """
         has_read_deps = True
+        _retain_native = False
         if config.triton.skip_l1_cache:
             buffer_read_counts = self.features.buffer_read_counts()
             # Graph inputs, primals_*, arg*_* would not be tracked by `buffer_read_counts`
@@ -3925,12 +3926,27 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 else:
                     shape = TritonSymbols.get_block_shape(indexing.index)
 
+            # For multi-tile retained loads in bf16/fp16, emit the raw load
+            # as a separate CSE var before the upcast so we can stash in
+            # native dtype.  The upcast (.to(tl.float32)) still happens for
+            # the reduction compute; the epilogue will upcast again from the
+            # retained native-dtype value.
+            _retain_native = (
+                dtype in (torch.float16, torch.bfloat16)
+                and config.triton.codegen_upcast_to_fp32
+                and self._persistent_tile_phase == "reduction"
+                and name in self.persistent_shared_read_names
+            )
+
             if (
                 dtype in (torch.float16, torch.bfloat16)
                 and config.triton.codegen_upcast_to_fp32
             ):
-                line += ".to(tl.float32)"
-                dtype = torch.float32
+                if _retain_native:
+                    pass  # line stays as-is; we'll stash raw and upcast after
+                else:
+                    line += ".to(tl.float32)"
+                    dtype = torch.float32
             if dtype == torch.bool and torch.version.hip is None:
                 # Workaround for https://github.com/triton-lang/triton/issues/2151
                 # tl.load returns int8 when loading from pointer to int1
@@ -3948,6 +3964,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             load_counts[name] -= 1  # don't double count cache hit
         assert isinstance(result_var, TritonCSEVariable)
         result_var.mask_vars = indexing.mask_vars  # type: ignore[assignment]
+
+        # For _retain_native: result_var is the raw bf16 load. Stash it,
+        # then generate the .to(tl.float32) upcast as a second CSE var.
+        if _retain_native:
+            self._retained_loads_current[name] = result_var
+            upcast_line = f"{result_var}.to(tl.float32)"
+            result_var = self.cse.generate(
+                load_buffer, upcast_line, dtype=torch.float32, shape=shape
+            )
 
         if append_broadcast:
             line = f"tl.broadcast_to({result_var}, {append_broadcast})"
@@ -3973,7 +3998,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.outside_loop_vars.add(result_var)
 
         if self._persistent_tile_phase == "reduction" and name in self.persistent_shared_read_names:
-            self._retained_loads_current[name] = result_var
+            if name not in self._retained_loads_current:
+                self._retained_loads_current[name] = result_var
 
         return result_var
 
