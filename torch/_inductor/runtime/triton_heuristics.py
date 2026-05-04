@@ -4407,7 +4407,7 @@ def persistent_reduction(
     max_tiles = inductor_meta.get("persistent_reduction_max_tiles", 1)
     if rnumel is not None and max_tiles > 1:
         tile_pairs = []
-        for nt in range(2, max_tiles + 1):
+        for nt in range(1, max_tiles + 1):
             ts = rnumel // nt
             if ts * nt == rnumel and ts >= 1024 and (ts & (ts - 1)) == 0:
                 tile_pairs.append((ts, nt))
