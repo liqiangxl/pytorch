@@ -2054,7 +2054,7 @@ class SIMDScheduling(BaseScheduling):
 
             # Try register-tiled persistent reduction path
             tiled = (
-                kernel.features.tiled_reduction_schedule()
+                kernel.features.get_reg_cached_persistent_reduction_config()
                 if getattr(kernel, "register_tiled_persistent_reduction", False)
                 else None
             )
@@ -2081,23 +2081,21 @@ class SIMDScheduling(BaseScheduling):
         if not kernel.begin_tiled_reduction(schedule):
             return False
 
-        for node in (*schedule.reduction_nodes, *schedule.epilogue_nodes):
+        for node in (schedule.reduction_node, schedule.epilogue_node):
             indexing_dtype_strength_reduction(node._body)
 
         for tile in range(schedule.num_tiles):
             kernel.begin_tile("reduction", tile)
-            for node in schedule.reduction_nodes:
-                index_vars = kernel.split_and_set_ranges(node.get_ranges())
-                node.codegen(index_vars)
+            index_vars = kernel.split_and_set_ranges(schedule.reduction_node.get_ranges())
+            schedule.reduction_node.codegen(index_vars)
             kernel.end_tile()
 
         kernel.finalize_tiled_reduction()
 
         for tile in range(schedule.num_tiles):
             kernel.begin_tile("epilogue", tile)
-            for node in schedule.epilogue_nodes:
-                index_vars = kernel.split_and_set_ranges(node.get_ranges())
-                node.codegen(index_vars)
+            index_vars = kernel.split_and_set_ranges(schedule.epilogue_node.get_ranges())
+            schedule.epilogue_node.codegen(index_vars)
             kernel.end_tile()
 
         kernel.end_tiled_reduction()

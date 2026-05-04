@@ -246,84 +246,75 @@ class SIMDKernelFeatures:
             )
         return result
 
-    @cache_on_self
-    def reduction_and_epilogue_nodes(
-        self,
-    ) -> tuple[tuple[SchedulerNode, ...], tuple[SchedulerNode, ...]] | None:
-        """Return (reduction_nodes, epilogue_nodes) if the schedule is a simple
-        fused reduction + epilogue.
+    def get_reg_cached_persistent_reduction_config(self) -> RegCachedPersistentReductionConfig | None:
+        """Check if this kernel qualifies for register-cached persistent reduction.
 
-        Recognizes:
-            reduction nodes, DisableReduction, epilogue nodes, EnableReduction
-            reduction nodes, DisableReduction, EnableReduction, epilogue nodes
+        Looks for a fused reduction+epilogue pattern where the epilogue re-reads
+        buffers already loaded by the reduction.  When found, the reduction
+        dimension is split into fixed-size tiles so that shared inputs are cached
+        in tiled registers rather than one large block.  This helps the downstream
+        compiler optimize register allocation for higher occupancy and performance.
+
+        The node schedule must contain exactly one reduction node and one
+        epilogue node separated by DisableReduction/EnableReduction markers:
+            [red, DisableReduction, epi, EnableReduction]
+            [red, DisableReduction, EnableReduction, epi]
         """
-        if DisableReduction not in self.node_schedule:
+        from .. import config
+
+        if not config.triton.register_tiled_persistent_reductions:
             return None
 
+        # --- extract exactly one reduction node and one epilogue node ---
+        if DisableReduction not in self.node_schedule:
+            return None
         try:
             disable_idx = self.node_schedule.index(DisableReduction)
             enable_idx = self.node_schedule.index(EnableReduction, disable_idx + 1)
         except ValueError:
             return None
 
-        between_markers = self.node_schedule[disable_idx + 1 : enable_idx]
-        after_enable = self.node_schedule[enable_idx + 1 :]
-        if any(
-            marker in after_enable for marker in (DisableReduction, EnableReduction)
-        ):
+        before = [
+            n
+            for n in self.node_schedule[:disable_idx]
+            if n is not DisableReduction and n is not EnableReduction
+        ]
+        between = [
+            n
+            for n in self.node_schedule[disable_idx + 1 : enable_idx]
+            if n is not DisableReduction and n is not EnableReduction
+        ]
+        after = [
+            n
+            for n in self.node_schedule[enable_idx + 1 :]
+            if n is not DisableReduction and n is not EnableReduction
+        ]
+
+        if len(before) != 1:
             return None
-
-        reduction_nodes = tuple(
-            NodeScheduleMarker.only_nodes(self.node_schedule[:disable_idx])
-        )
-        between_nodes = tuple(NodeScheduleMarker.only_nodes(between_markers))
-        after_nodes = tuple(NodeScheduleMarker.only_nodes(after_enable))
-
-        if between_nodes and after_nodes:
+        if between and after:
             return None
-        epilogue_nodes = between_nodes or after_nodes
-        if not reduction_nodes or not epilogue_nodes:
+        epilogue = between or after
+        if len(epilogue) != 1:
             return None
-        return reduction_nodes, epilogue_nodes
+        reduction_node: SchedulerNode = before[0]  # type: ignore[assignment]
+        epilogue_node: SchedulerNode = epilogue[0]  # type: ignore[assignment]
 
-    @cache_on_self
-    def reduction_epilogue_shared_read_names(self) -> tuple[str, ...]:
-        """Buffer names read by both the reduction and epilogue segments."""
-        segments = self.reduction_and_epilogue_nodes()
-        if segments is None:
-            return ()
-        reduction_nodes, epilogue_nodes = segments
-
+        # --- find buffer names read by both the reduction and epilogue ---
         reduction_reads: OrderedSet[str] = OrderedSet()
-        for node in reduction_nodes:
-            for dep in node.read_writes.reads:
-                if isinstance(dep, MemoryDep):
-                    reduction_reads.add(dep.name)
+        for dep in reduction_node.read_writes.reads:
+            if isinstance(dep, MemoryDep):
+                reduction_reads.add(dep.name)
 
-        shared: OrderedSet[str] = OrderedSet()
-        for node in epilogue_nodes:
-            for dep in node.read_writes.reads:
-                if isinstance(dep, MemoryDep) and dep.name in reduction_reads:
-                    shared.add(dep.name)
+        shared_read_names: list[str] = []
+        for dep in epilogue_node.read_writes.reads:
+            if isinstance(dep, MemoryDep) and dep.name in reduction_reads:
+                shared_read_names.append(dep.name)
 
-        return tuple(shared)
-
-    def tiled_reduction_schedule(self) -> TiledReductionSchedule | None:
-        """Build a TiledReductionSchedule if this kernel qualifies."""
-        from .. import config
-
-        if not config.triton.register_tiled_persistent_reductions:
-            return None
-
-        segments = self.reduction_and_epilogue_nodes()
-        if segments is None:
-            return None
-        reduction_nodes, epilogue_nodes = segments
-
-        shared_read_names = self.reduction_epilogue_shared_read_names()
         if not shared_read_names:
             return None
 
+        # --- validate reduction dimension for tiling ---
         rnumel = V.graph.sizevars.simplify(self.reduction_numel)
         if not isinstance(rnumel, (sympy.Integer, int)):
             return None
@@ -344,26 +335,34 @@ class SIMDKernelFeatures:
         num_tiles = rnumel // tile_size
         if num_tiles < 1 or num_tiles > max_tiles:
             return None
+        # require power-of-two reduction dimension for efficient tiling
         if rnumel & (rnumel - 1) != 0:
             return None
 
-        return TiledReductionSchedule(
+        return RegCachedPersistentReductionConfig(
             tile_size=tile_size,
             num_tiles=num_tiles,
-            reduction_nodes=reduction_nodes,
-            epilogue_nodes=epilogue_nodes,
-            shared_read_names=shared_read_names,
+            reduction_node=reduction_node,
+            epilogue_node=epilogue_node,
+            shared_read_names=tuple(shared_read_names),
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class TiledReductionSchedule:
-    """Pre-computed schedule for register-tiled persistent reductions."""
+class RegCachedPersistentReductionConfig:
+    """Configuration for register-cached persistent reductions.
+
+    The reduction dimension is split into ``num_tiles`` tiles of
+    ``tile_size`` elements each.  Inputs named in ``shared_read_names``
+    are cached in multiple tiled registers instead of one large block,
+    helping the downstream compiler optimize register allocation for
+    higher occupancy and performance.
+    """
 
     tile_size: int
     num_tiles: int
-    reduction_nodes: tuple[SchedulerNode, ...]
-    epilogue_nodes: tuple[SchedulerNode, ...]
+    reduction_node: SchedulerNode
+    epilogue_node: SchedulerNode
     shared_read_names: tuple[str, ...]
 
 

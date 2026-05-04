@@ -2796,7 +2796,7 @@ class _TiledReductionAccumulator:
 class _TiledContext:
     """State for register-tiled persistent reduction codegen."""
 
-    schedule: Any  # TiledReductionSchedule
+    schedule: Any  # RegCachedPersistentReductionConfig
     phase: str = "reduction"
     tile: int = 0
     retained: dict[tuple[int, str], TritonCSEVariable] = dataclasses.field(
@@ -5275,7 +5275,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return False
         if torch.version.hip:
             return False
-        return self.features.tiled_reduction_schedule() is not None
+        return self.features.get_reg_cached_persistent_reduction_config() is not None
 
     def begin_tiled_reduction(self, schedule) -> bool:
         """Validate and set up tiled reduction context. Returns False to fall back."""
@@ -5292,13 +5292,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "argmax", "argmin", "dot", "online_softmax_reduce",
             "welford_reduce", "welford_combine",
         }
-        for node in schedule.reduction_nodes:
-            snodes = getattr(node, "snodes", (node,))
-            for snode in snodes:
-                rtype = snode.node.get_reduction_type()
-                if rtype in unsupported:
-                    self.register_tiled_persistent_reduction = False
-                    return False
+        snodes = getattr(schedule.reduction_node, "snodes", (schedule.reduction_node,))
+        for snode in snodes:
+            rtype = snode.node.get_reduction_type()
+            if rtype in unsupported:
+                self.register_tiled_persistent_reduction = False
+                return False
 
         self._tiled_ctx = _TiledContext(schedule=schedule)
         return True
