@@ -4088,23 +4088,6 @@ def reduction(
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
-    tile_size = inductor_meta.get("persistent_reduction_tile_size")
-    if tile_size is not None and inductor_meta.get("persistent_reduction_num_tiles", 1) > 1:
-        clamped = []
-        for c in configs:
-            kw = dict(c.kwargs)
-            for k in list(kw):
-                if k.startswith("R") and k.endswith("BLOCK"):
-                    kw[k] = tile_size
-            clamped.append(Config(kw, num_warps=c.num_warps, num_stages=c.num_stages))
-        seen: set[tuple[Any, ...]] = set()
-        configs = []
-        for c in clamped:
-            key = (tuple(sorted(c.kwargs.items())), c.num_warps, c.num_stages)
-            if key not in seen:
-                seen.add(key)
-                configs.append(c)
-
     if return_configs:
         return configs
 
@@ -4415,6 +4398,17 @@ def persistent_reduction(
         configs = unique_configs(new_configs)
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+
+    # Multi-tile persistent: inject R0_BLOCK and NUM_TILES into configs.
+    # The tile count is fixed at codegen time (retained-load variables are
+    # pre-declared per tile), so we only vary XBLOCK and num_warps.
+    tile_size = inductor_meta.get("persistent_reduction_tile_size")
+    num_tiles = inductor_meta.get("persistent_reduction_num_tiles", 1)
+    if tile_size is not None and num_tiles > 1:
+        for c in configs:
+            c.kwargs["R0_BLOCK"] = tile_size
+            c.kwargs["NUM_TILES"] = num_tiles
+        configs = unique_configs(configs)
 
     if return_configs:
         return configs

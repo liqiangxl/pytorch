@@ -5329,10 +5329,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         elif self.inside_reduction and self.num_persistent_tiles > 1:
             # Multi-tile persistent reduction: wrap staging buffers in
             # tl.static_range loops.  The node was codegen'd once — the
-            # loop handles repetition across tiles.
+            # loop handles repetition across tiles.  NUM_TILES and R0_BLOCK
+            # are constexpr function params so the autotuner can try
+            # different tile sizes.
             num_tiles = self.num_persistent_tiles
-            tile_size = self.persistent_tile_size
-            assert tile_size is not None
 
             if self._persistent_tile_phase == "reduction":
                 # Pre-declare retained-load variables before the loop
@@ -5348,15 +5348,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     self._retained_load_var_names[name] = var_names
 
             self.body.writeline(
-                f"for _tile in tl.static_range({num_tiles}):"
+                "for _tile in tl.static_range(NUM_TILES):"
             )
             with self.body.indent():
-                # Emit tile range header
+                # Emit tile range header using R0_BLOCK (autotunable constexpr)
                 for tree in self.range_trees:
                     if not tree.is_reduction:
                         continue
                     x = tree.prefix
-                    self.body.writeline(f"{x}offset = _tile * {tile_size}")
+                    self.body.writeline(f"{x}offset = _tile * {x.upper()}BLOCK")
                     self.body.writeline(
                         f"{tree.name} = {x}offset + {self.iteration_ranges_ranges_code(tree)}"
                     )
@@ -5956,7 +5956,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         for tree in self.range_trees:
             if tree.is_reduction and self.persistent_reduction:
-                # Rn_BLOCK for persistent_reduction is defined in codegen_static_numels
+                if self.num_persistent_tiles > 1:
+                    add_constexpr_arg(f"{tree.prefix.upper()}BLOCK")
+                else:
+                    # Rn_BLOCK for single-tile persistent is defined in codegen_static_numels
+                    pass
                 continue
             if tree.tensor_dim is None:
                 continue
@@ -5965,6 +5969,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.cooperative_reduction:
             add_constexpr_arg("RSPLIT")
+
+        if self.num_persistent_tiles > 1:
+            add_constexpr_arg("NUM_TILES")
 
         if self.mix_order_reduction:
             add_constexpr_arg("RSPLIT_SIZE")
@@ -6151,11 +6158,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     code.writeline(f"{tree.prefix}numel = {int(simplified_tree_numel)}")
 
             if tree.is_reduction and self.persistent_reduction:
-                if self.cooperative_reduction:
+                if self.num_persistent_tiles > 1:
+                    continue  # R0_BLOCK is a function parameter for multi-tile
+                elif self.cooperative_reduction:
                     numel = self.kexpr(self.rename_indexing(tree.numel))
                     val = f"triton_helpers.constexpr_next_power_of_2(({numel} + RSPLIT - 1) // RSPLIT)"
-                elif self.num_persistent_tiles > 1:
-                    val = self.persistent_tile_size
                 else:
                     val = self._get_persistent_RBLOCK(tree.numel)
                     if self.is_native_matmul:

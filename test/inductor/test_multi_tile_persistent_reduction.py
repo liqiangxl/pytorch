@@ -52,8 +52,8 @@ class TestMultiTilePersistentReduction(TestCase):
 
         # Should use persistent_reduction heuristic (not plain reduction)
         self.assertIn("persistent_reduction", code[0])
-        # Should use tl.static_range loop, not unrolled offsets or tl.range
-        self.assertIn("tl.static_range(2)", code[0])
+        # Should use tl.static_range loop with NUM_TILES param
+        self.assertIn("tl.static_range(NUM_TILES)", code[0])
         self.assertNotIn("tl.range(", code[0])
 
     def test_rmsnorm_pattern(self):
@@ -84,8 +84,9 @@ class TestMultiTilePersistentReduction(TestCase):
         x = torch.randn(8, 16384, device=GPU_TYPE)
         code = self._run_and_check(fn, x)
 
-        # 4 tiles via tl.static_range
-        self.assertIn("tl.static_range(4)", code[0])
+        # 4 tiles via NUM_TILES param
+        self.assertIn("tl.static_range(NUM_TILES)", code[0])
+        self.assertIn("'persistent_reduction_num_tiles': 4", code[0])
 
     def test_no_epilogue_reload(self):
         """Epilogue should reuse retained loads, not emit a second tl.load for x."""
