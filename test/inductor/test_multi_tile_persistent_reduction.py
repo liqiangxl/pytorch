@@ -52,10 +52,9 @@ class TestMultiTilePersistentReduction(TestCase):
 
         # Should use persistent_reduction heuristic (not plain reduction)
         self.assertIn("persistent_reduction", code[0])
-        # Should have static tile offsets (no tl.range reduction loop)
-        self.assertIn("r0_offset = 0", code[0])
-        self.assertIn("r0_offset = 4096", code[0])
-        self.assertNotIn("tl.range", code[0])
+        # Should use tl.static_range loop, not unrolled offsets or tl.range
+        self.assertIn("tl.static_range(2)", code[0])
+        self.assertNotIn("tl.range(", code[0])
 
     def test_rmsnorm_pattern(self):
         """RMSNorm-like: x * rsqrt(mean(x^2)) — the motivating use case."""
@@ -85,11 +84,8 @@ class TestMultiTilePersistentReduction(TestCase):
         x = torch.randn(8, 16384, device=GPU_TYPE)
         code = self._run_and_check(fn, x)
 
-        # 4 tile offsets: 0, 4096, 8192, 12288
-        self.assertIn("r0_offset = 0", code[0])
-        self.assertIn("r0_offset = 4096", code[0])
-        self.assertIn("r0_offset = 8192", code[0])
-        self.assertIn("r0_offset = 12288", code[0])
+        # 4 tiles via tl.static_range
+        self.assertIn("tl.static_range(4)", code[0])
 
     def test_no_epilogue_reload(self):
         """Epilogue should reuse retained loads, not emit a second tl.load for x."""
@@ -100,9 +96,9 @@ class TestMultiTilePersistentReduction(TestCase):
         x = torch.randn(16, 8192, device=GPU_TYPE)
         code = self._run_and_check(fn, x)
 
-        # Count tl.load calls — should be 2 (one per tile), not 4
+        # Count tl.load calls — should be 1 (inside the loop, runs per tile), not 2 or 4
         load_count = code[0].count("tl.load")
-        self.assertEqual(load_count, 2, f"Expected 2 loads (one per tile), got {load_count}")
+        self.assertEqual(load_count, 1, f"Expected 1 tl.load (inside loop), got {load_count}")
 
     def test_small_rnumel_stays_single_tile(self):
         """rnumel=1024 is below min_numel — should use standard persistent, no tiling."""
@@ -115,9 +111,9 @@ class TestMultiTilePersistentReduction(TestCase):
         with inductor_config.patch(multi_tile_config):
             _, code = run_and_get_code(compiled, x)
 
-        # Should be persistent but without multi-tile offsets
+        # Should be persistent but without multi-tile
         self.assertIn("persistent_reduction", code[0])
-        self.assertNotIn("r0_offset = 4096", code[0])
+        self.assertNotIn("tl.static_range", code[0])
         self.assertNotIn("persistent_reduction_num_tiles", code[0])
 
     def test_non_power_of_two_falls_back(self):
@@ -131,8 +127,8 @@ class TestMultiTilePersistentReduction(TestCase):
         with inductor_config.patch(multi_tile_config):
             _, code = run_and_get_code(compiled, x)
 
-        # Should not have tile offsets
-        self.assertNotIn("r0_offset = 4096", code[0])
+        # Should not have tl.static_range (falls back to non-tiled)
+        self.assertNotIn("tl.static_range", code[0])
 
     def test_welford_falls_back(self):
         """torch.var_mean uses welford reduction — unsupported, should fall back."""
@@ -174,7 +170,7 @@ class TestMultiTilePersistentReduction(TestCase):
         compiled = torch.compile(fn)
         # No config patch — feature is off
         _, code = run_and_get_code(compiled, x)
-        self.assertNotIn("r0_offset = 4096", code[0])
+        self.assertNotIn("tl.static_range", code[0])
         self.assertNotIn("persistent_reduction_num_tiles", code[0])
 
 
