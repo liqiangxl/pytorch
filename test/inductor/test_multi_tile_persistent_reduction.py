@@ -22,7 +22,7 @@ from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU_AND_TRITON
 multi_tile_config = {
     "triton.register_tiled_persistent_reductions": True,
     "triton.register_tiled_persistent_reduction_tile_size": 4096,
-    "triton.register_tiled_persistent_reduction_max_tiles": 8,
+    "triton.register_tiled_persistent_reduction_max_tiles": 4,
     "triton.register_tiled_persistent_reduction_min_numel": 2049,
 }
 

@@ -5342,19 +5342,23 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 f"num_persistent_tiles ({self.num_persistent_tiles}) exceeds "
                 f"max_tiles ({max_tiles})"
             )
-            self.body.writeline(
-                f"tl.static_assert(NUM_TILES <= {max_tiles}, "
-                f"'NUM_TILES must be <= {max_tiles}')"
-            )
+
+            if self._persistent_tile_phase == "reduction":
+                self.body.writeline(
+                    f"tl.static_assert(NUM_TILES <= {max_tiles}, "
+                    f"'NUM_TILES must be <= {max_tiles}')"
+                )
 
             if self._persistent_tile_phase == "reduction":
                 for name in self.persistent_shared_read_names:
                     safe_name = name.replace(".", "_")
+                    dtype = V.graph.get_dtype(name)
+                    triton_dtype = triton_type(dtype)
                     var_names = []
                     for i in range(max_tiles):
                         vname = f"_retained_{safe_name}_{i}"
                         self.body.writeline(
-                            f"{vname} = tl.full({self.dense_size_str()}, 0.0, tl.float32)"
+                            f"{vname} = tl.full({self.dense_size_str()}, 0.0, {triton_dtype})"
                         )
                         var_names.append(vname)
                     self._retained_load_var_names[name] = var_names
