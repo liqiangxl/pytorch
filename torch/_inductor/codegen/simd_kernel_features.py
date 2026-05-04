@@ -342,6 +342,8 @@ class SIMDKernelFeatures:
         return PersistentReductionTileConfig(
             tile_size=tile_size,
             num_tiles=num_tiles,
+            max_tiles=max_tiles,
+            rnumel=rnumel,
             reduction_node=reduction_node,
             epilogue_node=epilogue_node,
             shared_read_names=tuple(shared_read_names),
@@ -361,6 +363,8 @@ class PersistentReductionTileConfig:
 
     tile_size: int
     num_tiles: int
+    max_tiles: int
+    rnumel: int
     reduction_node: SchedulerNode
     epilogue_node: SchedulerNode
     shared_read_names: tuple[str, ...]

@@ -1916,7 +1916,7 @@ class triton:
     )
     register_tiled_persistent_reduction_max_tiles: int = int(
         os.environ.get(
-            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MAX_TILES", "8"
+            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MAX_TILES", "4"
         )
     )
     register_tiled_persistent_reduction_min_numel: int = int(

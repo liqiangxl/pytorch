@@ -4399,16 +4399,32 @@ def persistent_reduction(
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
-    # Multi-tile persistent: inject R0_BLOCK and NUM_TILES into configs.
-    # The tile count is fixed at codegen time (retained-load variables are
-    # pre-declared per tile), so we only vary XBLOCK and num_warps.
-    tile_size = inductor_meta.get("persistent_reduction_tile_size")
-    num_tiles = inductor_meta.get("persistent_reduction_num_tiles", 1)
-    if tile_size is not None and num_tiles > 1:
-        for c in configs:
-            c.kwargs["R0_BLOCK"] = tile_size
-            c.kwargs["NUM_TILES"] = num_tiles
-        configs = unique_configs(configs)
+    # Multi-tile persistent: generate configs with all valid
+    # R0_BLOCK / NUM_TILES pairs.  Retained-load variables are
+    # pre-declared for max_tiles, so the compiler dead-code-eliminates
+    # unused tiles when NUM_TILES < max_tiles.
+    rnumel = inductor_meta.get("persistent_reduction_rnumel")
+    max_tiles = inductor_meta.get("persistent_reduction_max_tiles", 1)
+    if rnumel is not None and max_tiles > 1:
+        tile_pairs = []
+        for nt in range(2, max_tiles + 1):
+            ts = rnumel // nt
+            if ts * nt == rnumel and ts >= 1024 and (ts & (ts - 1)) == 0:
+                tile_pairs.append((ts, nt))
+        if not tile_pairs:
+            tile_size = inductor_meta.get("persistent_reduction_tile_size")
+            num_tiles = inductor_meta.get("persistent_reduction_num_tiles", 1)
+            if tile_size and num_tiles > 1:
+                tile_pairs = [(tile_size, num_tiles)]
+        if tile_pairs:
+            expanded = []
+            for c in configs:
+                for ts, nt in tile_pairs:
+                    kw = dict(c.kwargs)
+                    kw["R0_BLOCK"] = ts
+                    kw["NUM_TILES"] = nt
+                    expanded.append(Config(kw, num_warps=c.num_warps, num_stages=c.num_stages))
+            configs = unique_configs(expanded)
 
     if return_configs:
         return configs

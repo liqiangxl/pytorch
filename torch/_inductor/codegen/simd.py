@@ -437,6 +437,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         # num_tiles=1 is the standard persistent path.
         self.num_persistent_tiles: int = 1
         self.persistent_tile_size: int | None = None
+        self.persistent_max_tiles: int = 1
+        self.persistent_rnumel: int | None = None
         self.persistent_shared_read_names: tuple[str, ...] = ()
         self.mix_order_reduction: bool = mix_order_reduction
         self.no_x_dim = self.want_no_x_dim()

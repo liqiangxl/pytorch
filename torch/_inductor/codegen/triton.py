@@ -5230,6 +5230,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.persistent_reduction = True
         self.num_persistent_tiles = tile_config.num_tiles
         self.persistent_tile_size = tile_config.tile_size
+        self.persistent_max_tiles = tile_config.max_tiles
+        self.persistent_rnumel = tile_config.rnumel
         self.persistent_shared_read_names = tile_config.shared_read_names
         self._persistent_tile_phase = "reduction"
         if not already_persistent:
@@ -5332,14 +5334,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # loop handles repetition across tiles.  NUM_TILES and R0_BLOCK
             # are constexpr function params so the autotuner can try
             # different tile sizes.
-            num_tiles = self.num_persistent_tiles
+            # Pre-declare retained-load variables for max_tiles so the
+            # autotuner can vary NUM_TILES.  Unused tiles are dead-code-
+            # eliminated by the compiler since tl.static_range unrolls.
+            max_tiles = self.persistent_max_tiles
 
             if self._persistent_tile_phase == "reduction":
-                # Pre-declare retained-load variables before the loop
                 for name in self.persistent_shared_read_names:
                     safe_name = name.replace(".", "_")
                     var_names = []
-                    for i in range(num_tiles):
+                    for i in range(max_tiles):
                         vname = f"_retained_{safe_name}_{i}"
                         self.body.writeline(
                             f"{vname} = tl.full({self.dense_size_str()}, 0.0, tl.float32)"
@@ -5791,6 +5795,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             out["dynamic_scale_rblock"] = False
             out["persistent_reduction_num_tiles"] = self.num_persistent_tiles
             out["persistent_reduction_tile_size"] = self.persistent_tile_size
+            out["persistent_reduction_max_tiles"] = self.persistent_max_tiles
+            out["persistent_reduction_rnumel"] = self.persistent_rnumel
         if (
             config.benchmark_kernel
             or config.profile_bandwidth
