@@ -2058,34 +2058,11 @@ class SIMDScheduling(BaseScheduling):
 
             kernel.finalize_indexing(all_indexing.keys())
 
-            # Multi-tile persistent reduction: replay nodes per tile
             if (
                 getattr(kernel, "num_persistent_tiles", 1) > 1
                 and kernel.persistent_reduction
             ):
-                tile_config = kernel.features.get_reg_cached_persistent_reduction_config()
-                assert tile_config is not None
-                red_node = tile_config.reduction_node
-                epi_node = tile_config.epilogue_node
-
-                for node in (red_node, epi_node):
-                    indexing_dtype_strength_reduction(node._body)
-
-                for tile in range(kernel.num_persistent_tiles):
-                    kernel.set_persistent_tile("reduction", tile)
-                    index_vars = kernel.split_and_set_ranges(red_node.get_ranges())
-                    red_node.codegen(index_vars)
-                    kernel.flush_persistent_tile()
-
-                kernel.flush_persistent_reduction()
-
-                for tile in range(kernel.num_persistent_tiles):
-                    kernel.set_persistent_tile("epilogue", tile)
-                    index_vars = kernel.split_and_set_ranges(epi_node.get_ranges())
-                    epi_node.codegen(index_vars)
-                    kernel.flush_persistent_tile()
-
-                kernel.clear_persistent_tile()
+                self.codegen_multi_tile_persistent_reduction(kernel)
                 return
 
             # Second pass to do codegen
@@ -2099,6 +2076,46 @@ class SIMDScheduling(BaseScheduling):
                     indexing_dtype_strength_reduction(node._body)
                     index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     node.codegen(index_vars)
+
+    def codegen_multi_tile_persistent_reduction(self, kernel):
+        """Replay reduction and epilogue nodes once per tile for multi-tile persistent reduction.
+
+        Each tile covers a disjoint slice of the reduction dimension
+        (tile_size elements).  Shared-source loads are retained in registers
+        during the reduction phase and forwarded to the epilogue phase for the
+        same tile, avoiding a reload from global memory.
+        """
+        tile_config = kernel.features.get_reg_cached_persistent_reduction_config()
+        assert tile_config is not None
+        red_node = tile_config.reduction_node
+        epi_node = tile_config.epilogue_node
+
+        for node in (red_node, epi_node):
+            indexing_dtype_strength_reduction(node._body)
+
+        # Phase 1 — Reduction tiles: each tile loads its slice of the
+        # input, updates the cross-tile accumulator, and stashes
+        # shared-source loads for later epilogue reuse.
+        for tile in range(kernel.num_persistent_tiles):
+            kernel.set_persistent_tile("reduction", tile)
+            index_vars = kernel.split_and_set_ranges(red_node.get_ranges())
+            red_node.codegen(index_vars)
+            kernel.flush_persistent_tile()
+
+        # Emit the final reduction (e.g. tl.sum) and store once,
+        # after all tiles have contributed to the accumulator.
+        kernel.flush_persistent_reduction()
+
+        # Phase 2 — Epilogue tiles: each tile reuses the retained
+        # source loads from the corresponding reduction tile and
+        # applies the epilogue (e.g. x * inv_rms) without reloading.
+        for tile in range(kernel.num_persistent_tiles):
+            kernel.set_persistent_tile("epilogue", tile)
+            index_vars = kernel.split_and_set_ranges(epi_node.get_ranges())
+            epi_node.codegen(index_vars)
+            kernel.flush_persistent_tile()
+
+        kernel.clear_persistent_tile()
 
     def _codegen_single_template(
         self,
