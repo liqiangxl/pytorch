@@ -4088,8 +4088,8 @@ def reduction(
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
-    tile_size = inductor_meta.get("register_tiled_persistent_reduction_tile_size")
-    if tile_size is not None and inductor_meta.get("register_tiled_persistent_reduction"):
+    tile_size = inductor_meta.get("persistent_reduction_tile_size")
+    if tile_size is not None and inductor_meta.get("persistent_reduction_num_tiles", 1) > 1:
         clamped = []
         for c in configs:
             kw = dict(c.kwargs)

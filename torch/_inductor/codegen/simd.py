@@ -433,6 +433,11 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             if override_persistent_reduction is not None
             else self.should_use_persistent_reduction()
         )
+        # Multi-tile persistent reduction: tile_size * num_tiles == rnumel.
+        # num_tiles=1 is the standard persistent path.
+        self.num_persistent_tiles: int = 1
+        self.persistent_tile_size: int | None = None
+        self.persistent_shared_read_names: tuple[str, ...] = ()
         self.mix_order_reduction: bool = mix_order_reduction
         self.no_x_dim = self.want_no_x_dim()
         self.code_hash: str | None = None
@@ -459,6 +464,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             return self.combine_modular_indexing_pairs(index)
 
         self.simplify_indexing = simplify_indexing
+        self._pid_cache = pid_cache
         self.initialize_range_tree(pid_cache)
 
         self.rsplit_size = 0
@@ -2052,13 +2058,34 @@ class SIMDScheduling(BaseScheduling):
 
             kernel.finalize_indexing(all_indexing.keys())
 
-            # Try register-tiled persistent reduction path
-            tiled = (
-                kernel.features.get_reg_cached_persistent_reduction_config()
-                if getattr(kernel, "register_tiled_persistent_reduction", False)
-                else None
-            )
-            if tiled is not None and self.codegen_tiled_reduction(kernel, tiled):
+            # Multi-tile persistent reduction: replay nodes per tile
+            if (
+                getattr(kernel, "num_persistent_tiles", 1) > 1
+                and kernel.persistent_reduction
+            ):
+                tile_config = kernel.features.get_reg_cached_persistent_reduction_config()
+                assert tile_config is not None
+                red_node = tile_config.reduction_node
+                epi_node = tile_config.epilogue_node
+
+                for node in (red_node, epi_node):
+                    indexing_dtype_strength_reduction(node._body)
+
+                for tile in range(kernel.num_persistent_tiles):
+                    kernel.set_persistent_tile("reduction", tile)
+                    index_vars = kernel.split_and_set_ranges(red_node.get_ranges())
+                    red_node.codegen(index_vars)
+                    kernel.flush_persistent_tile()
+
+                kernel.flush_persistent_reduction()
+
+                for tile in range(kernel.num_persistent_tiles):
+                    kernel.set_persistent_tile("epilogue", tile)
+                    index_vars = kernel.split_and_set_ranges(epi_node.get_ranges())
+                    epi_node.codegen(index_vars)
+                    kernel.flush_persistent_tile()
+
+                kernel.clear_persistent_tile()
                 return
 
             # Second pass to do codegen
@@ -2072,34 +2099,6 @@ class SIMDScheduling(BaseScheduling):
                     indexing_dtype_strength_reduction(node._body)
                     index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     node.codegen(index_vars)
-
-    def codegen_tiled_reduction(self, kernel, schedule):
-        """Drive register-tiled persistent reduction from the scheduler level.
-
-        Returns True if the tiled path was taken, False to fall back.
-        """
-        if not kernel.begin_tiled_reduction(schedule):
-            return False
-
-        for node in (schedule.reduction_node, schedule.epilogue_node):
-            indexing_dtype_strength_reduction(node._body)
-
-        for tile in range(schedule.num_tiles):
-            kernel.begin_tile("reduction", tile)
-            index_vars = kernel.split_and_set_ranges(schedule.reduction_node.get_ranges())
-            schedule.reduction_node.codegen(index_vars)
-            kernel.end_tile()
-
-        kernel.finalize_tiled_reduction()
-
-        for tile in range(schedule.num_tiles):
-            kernel.begin_tile("epilogue", tile)
-            index_vars = kernel.split_and_set_ranges(schedule.epilogue_node.get_ranges())
-            schedule.epilogue_node.codegen(index_vars)
-            kernel.end_tile()
-
-        kernel.end_tiled_reduction()
-        return True
 
     def _codegen_single_template(
         self,

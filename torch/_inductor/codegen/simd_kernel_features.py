@@ -246,7 +246,7 @@ class SIMDKernelFeatures:
             )
         return result
 
-    def get_reg_cached_persistent_reduction_config(self) -> RegCachedPersistentReductionConfig | None:
+    def get_reg_cached_persistent_reduction_config(self) -> PersistentReductionTileConfig | None:
         """Check if this kernel qualifies for register-cached persistent reduction.
 
         Looks for a fused reduction+epilogue pattern where the epilogue re-reads
@@ -339,7 +339,7 @@ class SIMDKernelFeatures:
         if rnumel & (rnumel - 1) != 0:
             return None
 
-        return RegCachedPersistentReductionConfig(
+        return PersistentReductionTileConfig(
             tile_size=tile_size,
             num_tiles=num_tiles,
             reduction_node=reduction_node,
@@ -349,8 +349,8 @@ class SIMDKernelFeatures:
 
 
 @dataclasses.dataclass(frozen=True)
-class RegCachedPersistentReductionConfig:
-    """Configuration for register-cached persistent reductions.
+class PersistentReductionTileConfig:
+    """Tile configuration for multi-tile persistent reductions.
 
     The reduction dimension is split into ``num_tiles`` tiles of
     ``tile_size`` elements each.  Inputs named in ``shared_read_names``
