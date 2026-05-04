@@ -4410,13 +4410,8 @@ def persistent_reduction(
         tile_pairs = []
         for nt in range(min_tiles, max_tiles + 1):
             ts = rnumel // nt
-            if ts * nt == rnumel and ts >= 1024 and (ts & (ts - 1)) == 0:
+            if ts * nt == rnumel:
                 tile_pairs.append((ts, nt))
-        if not tile_pairs:
-            tile_size = inductor_meta.get("persistent_reduction_tile_size")
-            num_tiles = inductor_meta.get("persistent_reduction_num_tiles", 1)
-            if tile_size and num_tiles > 1:
-                tile_pairs = [(tile_size, num_tiles)]
         if tile_pairs:
             expanded = []
             for c in configs:

@@ -21,7 +21,6 @@ from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU_AND_TRITON
 # Config to enable multi-tile persistent reductions with 2 tiles for 8192 rnumel
 multi_tile_config = {
     "triton.register_tiled_persistent_reductions": True,
-    "triton.register_tiled_persistent_reduction_tile_size": 4096,
     "triton.register_tiled_persistent_reduction_max_tiles": 4,
     "triton.register_tiled_persistent_reduction_min_numel": 2049,
 }
@@ -93,7 +92,7 @@ class TestMultiTilePersistentReduction(TestCase):
         self._run_and_check(fn, x, weight, atol=1e-2, rtol=1e-2)
 
     def test_four_tiles_fp32(self):
-        """rnumel=16384 with tile_size=4096 gives 4 tiles, fp32."""
+        """rnumel=16384 with max_tiles=4 gives up to 4 tiles, fp32."""
 
         def fn(x):
             return x / x.sum(dim=-1, keepdim=True)
@@ -102,10 +101,10 @@ class TestMultiTilePersistentReduction(TestCase):
         code = self._run_and_check(fn, x)
 
         self.assertIn("tl.static_range(NUM_TILES)", code[0])
-        self.assertIn("'persistent_reduction_num_tiles': 4", code[0])
+        self.assertIn("persistent_reduction_num_tiles", code[0])
 
     def test_four_tiles_bf16(self):
-        """rnumel=16384 with tile_size=4096 gives 4 tiles, bf16."""
+        """rnumel=16384 with max_tiles=4 gives up to 4 tiles, bf16."""
 
         def fn(x):
             return x / x.sum(dim=-1, keepdim=True)
@@ -114,7 +113,7 @@ class TestMultiTilePersistentReduction(TestCase):
         code = self._run_and_check(fn, x, atol=1e-2, rtol=1e-2)
 
         self.assertIn("tl.static_range(NUM_TILES)", code[0])
-        self.assertIn("'persistent_reduction_num_tiles': 4", code[0])
+        self.assertIn("persistent_reduction_num_tiles", code[0])
 
     # ---- retained-load test ----
 
@@ -147,13 +146,13 @@ class TestMultiTilePersistentReduction(TestCase):
         self.assertNotIn("tl.static_range", code[0])
         self.assertNotIn("persistent_reduction_num_tiles", code[0])
 
-    def test_non_power_of_two_falls_back(self):
-        """rnumel=6144 is not power-of-two — should not use multi-tile."""
+    def test_indivisible_rnumel_falls_back(self):
+        """rnumel=5003 (prime) — not evenly divisible by any tile count, should fall back."""
 
         def fn(x):
             return x / x.sum(dim=-1, keepdim=True)
 
-        x = torch.randn(16, 6144, device=GPU_TYPE)
+        x = torch.randn(16, 5003, device=GPU_TYPE)
         compiled = torch.compile(fn)
         with inductor_config.patch(multi_tile_config):
             _, code = run_and_get_code(compiled, x)
@@ -190,7 +189,7 @@ class TestMultiTilePersistentReduction(TestCase):
             _, code = run_and_get_code(compiled, x)
 
         self.assertIn("persistent_reduction_num_tiles", code[0])
-        self.assertIn("persistent_reduction_tile_size", code[0])
+        self.assertIn("persistent_reduction_rnumel", code[0])
 
     def test_feature_disabled_by_default(self):
         """Without the config flag, multi-tile should not activate."""

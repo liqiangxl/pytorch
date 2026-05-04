@@ -1909,24 +1909,19 @@ class triton:
         os.environ.get("TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTIONS", "0")
         == "1"
     )
-    register_tiled_persistent_reduction_tile_size: int = int(
+    register_tiled_persistent_reduction_min_numel: int = int(
         os.environ.get(
-            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_TILE_SIZE", "4096"
+            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_NUMEL", "2048"
         )
     )
     register_tiled_persistent_reduction_max_tiles: int = int(
         os.environ.get(
             "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MAX_TILES", "4"
         )
-    )
-    register_tiled_persistent_reduction_min_numel: int = int(
-        os.environ.get(
-            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_NUMEL", "2049"
-        )
-    )
+    )    
     register_tiled_persistent_reduction_min_tiles: int = int(
         os.environ.get(
-            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_TILES", "2"
+            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_TILES", "1"
         )
     )
 

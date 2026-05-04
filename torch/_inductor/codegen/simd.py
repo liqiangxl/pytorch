@@ -433,11 +433,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             if override_persistent_reduction is not None
             else self.should_use_persistent_reduction()
         )
-        # Multi-tile persistent reduction: tile_size * num_tiles == rnumel.
+        # Multi-tile persistent reduction: num_tiles tiles, each R0_BLOCK elements.
         # num_tiles=1 is the standard persistent path.
         self.num_persistent_tiles: int = 1
-        self.persistent_tile_size: int | None = None
-        self.persistent_max_tiles: int = 1
         self.persistent_rnumel: int | None = None
         self.persistent_shared_read_names: tuple[str, ...] = ()
         self.mix_order_reduction: bool = mix_order_reduction

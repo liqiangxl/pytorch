@@ -249,103 +249,44 @@ class SIMDKernelFeatures:
     def get_reg_cached_persistent_reduction_config(self) -> PersistentReductionTileConfig | None:
         """Check if this kernel qualifies for register-cached persistent reduction.
 
-        Looks for a fused reduction+epilogue pattern where the epilogue re-reads
-        buffers already loaded by the reduction.  When found, the reduction
-        dimension is split into fixed-size tiles so that shared inputs are cached
-        in tiled registers rather than one large block.  This helps the downstream
-        compiler optimize register allocation for higher occupancy and performance.
-
-        The node schedule must contain exactly one reduction node and one
-        epilogue node separated by DisableReduction/EnableReduction markers:
-            [red, DisableReduction, epi, EnableReduction]
-            [red, DisableReduction, EnableReduction, epi]
+        Requires exactly one reduction node and one pointwise (epilogue) node
+        that share at least one input buffer, with a reduction dimension large
+        enough to tile.
         """
         from .. import config
 
         if not config.triton.register_tiled_persistent_reductions:
             return None
 
-        # --- extract exactly one reduction node and one epilogue node ---
-        if DisableReduction not in self.node_schedule:
-            return None
-        try:
-            disable_idx = self.node_schedule.index(DisableReduction)
-            enable_idx = self.node_schedule.index(EnableReduction, disable_idx + 1)
-        except ValueError:
+        nodes = [n for n in self.node_schedule if isinstance(n, SchedulerNode)]
+        reductions = [n for n in nodes if n.is_reduction()]
+        pointwise = [n for n in nodes if not n.is_reduction()]
+        if len(reductions) != 1 or len(pointwise) != 1:
             return None
 
-        before = [
-            n
-            for n in self.node_schedule[:disable_idx]
-            if n is not DisableReduction and n is not EnableReduction
-        ]
-        between = [
-            n
-            for n in self.node_schedule[disable_idx + 1 : enable_idx]
-            if n is not DisableReduction and n is not EnableReduction
-        ]
-        after = [
-            n
-            for n in self.node_schedule[enable_idx + 1 :]
-            if n is not DisableReduction and n is not EnableReduction
-        ]
+        def mem_dep_names(node: SchedulerNode) -> OrderedSet[str]:
+            return OrderedSet(d.name for d in node.read_writes.reads if isinstance(d, MemoryDep))
 
-        if len(before) != 1:
-            return None
-        if between and after:
-            return None
-        epilogue = between or after
-        if len(epilogue) != 1:
-            return None
-        reduction_node: SchedulerNode = before[0]  # type: ignore[assignment]
-        epilogue_node: SchedulerNode = epilogue[0]  # type: ignore[assignment]
-
-        # --- find buffer names read by both the reduction and epilogue ---
-        reduction_reads: OrderedSet[str] = OrderedSet()
-        for dep in reduction_node.read_writes.reads:
-            if isinstance(dep, MemoryDep):
-                reduction_reads.add(dep.name)
-
-        shared_read_names: list[str] = []
-        for dep in epilogue_node.read_writes.reads:
-            if isinstance(dep, MemoryDep) and dep.name in reduction_reads:
-                shared_read_names.append(dep.name)
-
+        shared_read_names = mem_dep_names(reductions[0]) & mem_dep_names(pointwise[0])
         if not shared_read_names:
             return None
 
-        # --- validate reduction dimension for tiling ---
         rnumel = V.graph.sizevars.simplify(self.reduction_numel)
         if not isinstance(rnumel, (sympy.Integer, int)):
             return None
         rnumel = int(rnumel)
 
-        tile_size = max(
-            config.triton.register_tiled_persistent_reduction_tile_size, 1
-        )
-        max_tiles = max(
-            config.triton.register_tiled_persistent_reduction_max_tiles, 1
-        )
-        min_numel = config.triton.register_tiled_persistent_reduction_min_numel
+        if rnumel < config.triton.register_tiled_persistent_reduction_min_numel:
+            return None
 
-        if rnumel < min_numel:
-            return None
-        if rnumel % tile_size != 0:
-            return None
-        num_tiles = rnumel // tile_size
-        if num_tiles < 1 or num_tiles > max_tiles:
-            return None
-        # require power-of-two reduction dimension for efficient tiling
-        if rnumel & (rnumel - 1) != 0:
+        max_tiles = config.triton.register_tiled_persistent_reduction_max_tiles
+        num_tiles = next((nt for nt in range(max_tiles, 0, -1) if rnumel % nt == 0), None)
+        if num_tiles is None:
             return None
 
         return PersistentReductionTileConfig(
-            tile_size=tile_size,
             num_tiles=num_tiles,
-            max_tiles=max_tiles,
             rnumel=rnumel,
-            reduction_node=reduction_node,
-            epilogue_node=epilogue_node,
             shared_read_names=tuple(shared_read_names),
         )
 
@@ -354,19 +295,14 @@ class SIMDKernelFeatures:
 class PersistentReductionTileConfig:
     """Tile configuration for multi-tile persistent reductions.
 
-    The reduction dimension is split into ``num_tiles`` tiles of
-    ``tile_size`` elements each.  Inputs named in ``shared_read_names``
-    are cached in multiple tiled registers instead of one large block,
-    helping the downstream compiler optimize register allocation for
-    higher occupancy and performance.
+    The reduction dimension is split into ``num_tiles`` tiles.
+    Inputs named in ``shared_read_names`` are cached in multiple tiled
+    registers instead of one large block, helping the downstream compiler
+    optimize register allocation for higher occupancy and performance.
     """
 
-    tile_size: int
     num_tiles: int
-    max_tiles: int
     rnumel: int
-    reduction_node: SchedulerNode
-    epilogue_node: SchedulerNode
     shared_read_names: tuple[str, ...]
 
 
