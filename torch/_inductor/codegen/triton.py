@@ -5229,13 +5229,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _setup_multi_tile_persistent_reduction(self) -> None:
         """Check if this kernel qualifies for multi-tile persistent reduction.
 
-        If eligible, forces persistent_reduction=True and populates the tile
+        If eligible, sets persistent_reduction=True and populates the tile
         fields on the kernel so the scheduler can drive per-tile replay.
         """
         from ..runtime.hints import ReductionHint
 
-        if self.persistent_reduction:
-            return
         if self.cooperative_reduction:
             return
         if not self.features.is_reduction():
@@ -5249,14 +5247,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if tile_config is None:
             return
 
-        # Force persistent mode with multiple tiles
+        already_persistent = self.persistent_reduction
         self.persistent_reduction = True
         self.num_persistent_tiles = tile_config.num_tiles
         self.persistent_tile_size = tile_config.tile_size
         self.persistent_shared_read_names = tile_config.shared_read_names
-        # Rebuild range trees with is_loop=False now that we're persistent
-        self.range_trees.clear()
-        self.initialize_range_tree(self._pid_cache)
+        if not already_persistent:
+            # Rebuild range trees with is_loop=False now that we're persistent
+            self.range_trees.clear()
+            self.initialize_range_tree(self._pid_cache)
 
     def set_persistent_tile(self, phase: str, tile: int) -> None:
         """Set current tile phase and index for multi-tile persistent reduction."""
