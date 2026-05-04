@@ -29,20 +29,22 @@ multi_tile_config = {
 
 @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
 class TestMultiTilePersistentReduction(TestCase):
-    def _run_and_check(self, fn, *args):
+    def _run_and_check(self, fn, *args, atol=1e-4, rtol=1e-4):
         """Compile fn with multi-tile config, check correctness against eager."""
         expected = fn(*args)
         compiled = torch.compile(fn)
         with inductor_config.patch(multi_tile_config):
             actual, code = run_and_get_code(compiled, *args)
         self.assertTrue(
-            torch.allclose(expected, actual, atol=1e-4, rtol=1e-4),
-            f"max diff: {(expected - actual).abs().max().item()}",
+            torch.allclose(expected.float(), actual.float(), atol=atol, rtol=rtol),
+            f"max diff: {(expected.float() - actual.float()).abs().max().item()}",
         )
         return code
 
-    def test_simple_div_sum(self):
-        """x / x.sum(dim=-1, keepdim=True) — the canonical shared-read pattern."""
+    # ---- fp32 tests ----
+
+    def test_simple_div_sum_fp32(self):
+        """x / x.sum(dim=-1, keepdim=True) with fp32."""
 
         def fn(x):
             return x / x.sum(dim=-1, keepdim=True)
@@ -50,14 +52,36 @@ class TestMultiTilePersistentReduction(TestCase):
         x = torch.randn(16, 8192, device=GPU_TYPE)
         code = self._run_and_check(fn, x)
 
-        # Should use persistent_reduction heuristic (not plain reduction)
         self.assertIn("persistent_reduction", code[0])
-        # Should use tl.static_range loop with NUM_TILES param
         self.assertIn("tl.static_range(NUM_TILES)", code[0])
         self.assertNotIn("tl.range(", code[0])
 
-    def test_rmsnorm_pattern(self):
-        """RMSNorm-like: x * rsqrt(mean(x^2)) — the motivating use case."""
+    def test_simple_div_sum_bf16(self):
+        """x / x.sum(dim=-1, keepdim=True) with bf16."""
+
+        def fn(x):
+            return x / x.sum(dim=-1, keepdim=True)
+
+        x = torch.randn(16, 8192, device=GPU_TYPE, dtype=torch.bfloat16)
+        code = self._run_and_check(fn, x, atol=1e-2, rtol=1e-2)
+
+        self.assertIn("persistent_reduction", code[0])
+        self.assertIn("tl.static_range(NUM_TILES)", code[0])
+
+    def test_rmsnorm_fp32(self):
+        """RMSNorm-like pattern with fp32."""
+
+        def fn(x, weight):
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x_normed = x * torch.rsqrt(variance + 1e-6)
+            return x_normed * weight
+
+        x = torch.randn(32, 8192, device=GPU_TYPE)
+        weight = torch.randn(8192, device=GPU_TYPE)
+        self._run_and_check(fn, x, weight)
+
+    def test_rmsnorm_bf16(self):
+        """RMSNorm-like pattern with bf16 input and weight."""
 
         def fn(x, weight):
             variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
@@ -66,17 +90,10 @@ class TestMultiTilePersistentReduction(TestCase):
 
         x = torch.randn(32, 8192, device=GPU_TYPE, dtype=torch.bfloat16)
         weight = torch.randn(8192, device=GPU_TYPE, dtype=torch.bfloat16)
-        expected = fn(x, weight)
-        compiled = torch.compile(fn)
-        with inductor_config.patch(multi_tile_config):
-            actual = compiled(x, weight)
-        self.assertTrue(
-            torch.allclose(expected.float(), actual.float(), atol=1e-2, rtol=1e-2),
-            f"max diff: {(expected.float() - actual.float()).abs().max().item()}",
-        )
+        self._run_and_check(fn, x, weight, atol=1e-2, rtol=1e-2)
 
-    def test_four_tiles(self):
-        """rnumel=16384 with tile_size=4096 gives 4 tiles."""
+    def test_four_tiles_fp32(self):
+        """rnumel=16384 with tile_size=4096 gives 4 tiles, fp32."""
 
         def fn(x):
             return x / x.sum(dim=-1, keepdim=True)
@@ -84,9 +101,22 @@ class TestMultiTilePersistentReduction(TestCase):
         x = torch.randn(8, 16384, device=GPU_TYPE)
         code = self._run_and_check(fn, x)
 
-        # 4 tiles via NUM_TILES param
         self.assertIn("tl.static_range(NUM_TILES)", code[0])
         self.assertIn("'persistent_reduction_num_tiles': 4", code[0])
+
+    def test_four_tiles_bf16(self):
+        """rnumel=16384 with tile_size=4096 gives 4 tiles, bf16."""
+
+        def fn(x):
+            return x / x.sum(dim=-1, keepdim=True)
+
+        x = torch.randn(8, 16384, device=GPU_TYPE, dtype=torch.bfloat16)
+        code = self._run_and_check(fn, x, atol=1e-2, rtol=1e-2)
+
+        self.assertIn("tl.static_range(NUM_TILES)", code[0])
+        self.assertIn("'persistent_reduction_num_tiles': 4", code[0])
+
+    # ---- retained-load test ----
 
     def test_no_epilogue_reload(self):
         """Epilogue should reuse retained loads, not emit a second tl.load for x."""
@@ -97,9 +127,10 @@ class TestMultiTilePersistentReduction(TestCase):
         x = torch.randn(16, 8192, device=GPU_TYPE)
         code = self._run_and_check(fn, x)
 
-        # Count tl.load calls — should be 1 (inside the loop, runs per tile), not 2 or 4
         load_count = code[0].count("tl.load")
         self.assertEqual(load_count, 1, f"Expected 1 tl.load (inside loop), got {load_count}")
+
+    # ---- fallback tests ----
 
     def test_small_rnumel_stays_single_tile(self):
         """rnumel=1024 is below min_numel — should use standard persistent, no tiling."""
@@ -112,7 +143,6 @@ class TestMultiTilePersistentReduction(TestCase):
         with inductor_config.patch(multi_tile_config):
             _, code = run_and_get_code(compiled, x)
 
-        # Should be persistent but without multi-tile
         self.assertIn("persistent_reduction", code[0])
         self.assertNotIn("tl.static_range", code[0])
         self.assertNotIn("persistent_reduction_num_tiles", code[0])
@@ -128,7 +158,6 @@ class TestMultiTilePersistentReduction(TestCase):
         with inductor_config.patch(multi_tile_config):
             _, code = run_and_get_code(compiled, x)
 
-        # Should not have tl.static_range (falls back to non-tiled)
         self.assertNotIn("tl.static_range", code[0])
 
     def test_welford_falls_back(self):
@@ -146,6 +175,8 @@ class TestMultiTilePersistentReduction(TestCase):
         self.assertTrue(
             torch.allclose(expected, actual, atol=1e-4, rtol=1e-4),
         )
+
+    # ---- metadata / gating tests ----
 
     def test_metadata_emitted(self):
         """Check that inductor_meta contains tile metadata."""
@@ -169,7 +200,6 @@ class TestMultiTilePersistentReduction(TestCase):
 
         x = torch.randn(16, 8192, device=GPU_TYPE)
         compiled = torch.compile(fn)
-        # No config patch — feature is off
         _, code = run_and_get_code(compiled, x)
         self.assertNotIn("tl.static_range", code[0])
         self.assertNotIn("persistent_reduction_num_tiles", code[0])
