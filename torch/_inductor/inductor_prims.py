@@ -361,3 +361,15 @@ cvt_e8m0_rceil = make_prim(
     _cvt_e8m0_rceil_aten,
     doc="Convert float to e8m0 with ceiling rounding. Uses PTX cvt.rp.satfinite.ue8m0x2.f32 on SM100+.",
 )
+
+
+def _fma_bf16_to_f32_aten(a: Tensor, b: Tensor) -> Tensor:
+    """bf16×bf16→f32 multiply. Exact f32 precision without separate conversion."""
+    return a.float() * b.float()
+
+
+fma_bf16_to_f32 = make_prim(
+    "inductor_fma_bf16_to_f32(Tensor a, Tensor b) -> Tensor",
+    _fma_bf16_to_f32_aten,
+    doc="SM100 bf16×bf16→f32 multiply via fma.rn.f32.bf16 PTX instruction.",
+)

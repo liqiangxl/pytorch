@@ -99,7 +99,7 @@ class TestRegisterTiledPersistentReduction(TestCase):
         """RMSNorm-like pattern."""
 
         def fn(x, weight):
-            variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+            variance = x.pow(2).mean(-1, keepdim=True)
             x_normed = x * torch.rsqrt(variance + 1e-6)
             return x_normed * weight
 

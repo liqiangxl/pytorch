@@ -156,6 +156,39 @@ def _misc_patterns_init(input_device: torch.device | None = None):
     # TODO: Add pattern for cvt.rn.bf16x2.ue8m0x2 (e8m0 -> bf16 conversion)
     # This is the inverse operation for MX format dequantization
 
+    # Pattern: pow(x_bf16, 2) → fma.rn.f32.bf16 (single PTX instruction)
+    # Computes bf16×bf16→f32 directly without explicit dtype conversion.
+    # Requires codegen_upcast_to_fp32=False so loads stay in native bf16.
+    if device == "cuda" and torch.cuda.get_device_capability() >= (8, 0):
+        from .. import inductor_prims
+
+        def bf16_square_pattern(x):
+            return torch.ops.aten.pow.Tensor_Scalar(x, 2)
+
+        def bf16_square_replacement(x):
+            return inductor_prims.fma_bf16_to_f32(x, x)
+
+        def bf16_square_extra_check(match):
+            x = match.kwargs.get("x")
+            if x is None:
+                return False
+            x_val = x.meta.get("val")
+            return (
+                x_val is not None
+                and x_val.device.type == "cuda"
+                and x_val.dtype == torch.bfloat16
+            )
+
+        register_replacement(
+            bf16_square_pattern,
+            bf16_square_replacement,
+            [torch.randn(32, device="cuda", dtype=torch.bfloat16)],
+            fwd_only,
+            [post_grad_patterns],
+            extra_check=bf16_square_extra_check,
+            get_decomp_fn=lambda: {},
+        )
+
 
 class NumpyCompatNormalization:
     numpy_compat: dict[str, tuple[str, ...]] = {

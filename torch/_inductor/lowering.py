@@ -8699,6 +8699,32 @@ def cvt_e8m0_rceil_lowering(inp):
     return to_dtype(result, torch.uint8)
 
 
+@register_lowering(inductor_prims.fma_bf16_to_f32, type_promotion_kind=None)
+def fma_bf16_to_f32_lowering(a, b):
+    """
+    Lowering for fma_bf16_to_f32. Uses PTX fma.rn.f32.bf16 on SM80+.
+    Takes two bf16 inputs, returns f32 = a * b + 0.0.
+    """
+    if not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() >= (8, 0)
+    ):
+        raise NotImplementedError(
+            "fma_bf16_to_f32 requires SM80+ for PTX fma.rn.f32.bf16 instruction"
+        )
+
+    fn = functools.partial(
+        ops.inline_asm_elementwise,
+        asm="fma.rn.f32.bf16 $0, $1, $2, 0f00000000;",
+        constraints="=f,h,h",
+        dtype=torch.float32,
+        is_pure=True,
+        pack=1,
+        input_dtypes=(torch.bfloat16, torch.bfloat16),
+    )
+    return make_pointwise(fn)(a, b)
+
+
 @register_lowering(
     torch._higher_order_ops.inline_asm_elementwise, type_promotion_kind=None
 )
