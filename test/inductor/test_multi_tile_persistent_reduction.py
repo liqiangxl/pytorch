@@ -8,7 +8,6 @@ so shared inputs stay in registers across both phases.  These tests
 verify correctness, generated code shape, and fallback behaviour.
 """
 
-import sys
 import unittest
 
 import torch
