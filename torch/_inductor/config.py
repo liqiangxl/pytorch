@@ -1918,10 +1918,10 @@ class triton:
         os.environ.get(
             "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MAX_TILES", "4"
         )
-    )    
+    )
     register_tiled_persistent_reduction_min_tiles: int = int(
         os.environ.get(
-            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_TILES", "1"
+            "TORCHINDUCTOR_REGISTER_TILED_PERSISTENT_REDUCTION_MIN_TILES", "2"
         )
     )
 
