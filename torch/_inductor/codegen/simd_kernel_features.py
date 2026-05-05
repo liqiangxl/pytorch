@@ -286,8 +286,15 @@ class SIMDKernelFeatures:
         if rnumel < config.triton.register_tiled_persistent_reduction_min_numel:
             return None
 
+        min_tiles = config.triton.register_tiled_persistent_reduction_min_tiles
         max_tiles = config.triton.register_tiled_persistent_reduction_max_tiles
-        num_tiles = next((nt for nt in range(max_tiles, 0, -1) if rnumel % nt == 0), None)
+        if max_tiles < min_tiles:
+            return None
+
+        num_tiles = next(
+            (nt for nt in range(max_tiles, min_tiles - 1, -1) if rnumel % nt == 0),
+            None,
+        )
         if num_tiles is None:
             return None
 
