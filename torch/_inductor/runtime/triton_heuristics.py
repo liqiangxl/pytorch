@@ -4399,6 +4399,32 @@ def persistent_reduction(
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
+    # Multi-tile persistent: generate configs with all valid
+    # R0_BLOCK / NUM_TILES pairs.  Retained-load variables are
+    # pre-declared for max_tiles, so the compiler dead-code-eliminates
+    # unused tiles when NUM_TILES < max_tiles.
+    rnumel = inductor_meta.get("persistent_reduction_rnumel")
+    max_tiles = inductor_meta.get("persistent_reduction_max_tiles", 1)
+    min_tiles = inductor_meta.get("persistent_reduction_min_tiles", 2)
+    if rnumel is not None and max_tiles > 1:
+        tile_pairs = []
+        for nt in range(min_tiles, max_tiles + 1):
+            ts = rnumel // nt
+            if ts * nt == rnumel:
+                tile_pairs.append((ts, nt))
+        if tile_pairs:
+            expanded = []
+            for c in configs:
+                for ts, nt in tile_pairs:
+                    # With tiling, R0_BLOCK is smaller so fewer warps may
+                    # be optimal.  Generate configs with varied num_warps.
+                    for nw in (4, 8, c.num_warps):
+                        kw = dict(c.kwargs)
+                        kw["R0_BLOCK"] = ts
+                        kw["NUM_TILES"] = nt
+                        expanded.append(Config(kw, num_warps=nw, num_stages=c.num_stages))
+            configs = unique_configs(expanded)
+
     if return_configs:
         return configs
 
