@@ -2833,10 +2833,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.tma_min_block_sizes = dict[str, int]()
         self.hint_override = hint_override
         # Multi-tile persistent reduction state
-        self._persistent_tile_phase: str | None = None
+        self._persistent_tile_phase: str | None = (
+            "reduction" if self.num_persistent_tiles > 1 else None
+        )
         self._retained_loads_current: dict[str, Any] = {}
         self._retained_load_var_names: dict[str, list[str]] = {}
-        self._setup_multi_tile_persistent_reduction()
         self._load_counts: collections.Counter[str] = collections.Counter()
         self._pdl_load_index = 0
         self._pdl_has_wait = False
@@ -5224,37 +5225,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.prologue.clear()
         self.prologue_cache.clear()
 
-    def _setup_multi_tile_persistent_reduction(self) -> None:
-        """Check if this kernel qualifies for multi-tile persistent reduction.
-
-        If eligible, sets persistent_reduction=True and populates the tile
-        fields on the kernel so the scheduler can drive per-tile replay.
-        """
-        from ..runtime.hints import ReductionHint
-
-        if self.cooperative_reduction:
-            return
-        if not self.features.is_reduction():
-            return
-        if self.features.get_reduction_hint() != ReductionHint.INNER:
-            return
-        if torch.version.hip:
-            return
-
-        tile_config = self.features.get_reg_cached_persistent_reduction_config()
-        if tile_config is None:
-            return
-
-        already_persistent = self.persistent_reduction
-        self.persistent_reduction = True
-        self.num_persistent_tiles = tile_config.num_tiles
-        self.persistent_rnumel = tile_config.rnumel
-        self.persistent_shared_read_names = tile_config.shared_read_names
-        self._persistent_tile_phase = "reduction"
-        if not already_persistent:
-            # Rebuild range trees with is_loop=False now that we're persistent
-            self.range_trees.clear()
-            self.initialize_range_tree(self._pid_cache)
 
     def codegen_body(self):
         """

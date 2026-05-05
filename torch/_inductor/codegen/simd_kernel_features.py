@@ -254,8 +254,15 @@ class SIMDKernelFeatures:
         enough to tile.
         """
         from .. import config
+        from ..runtime.hints import ReductionHint
 
         if not config.triton.register_tiled_persistent_reductions:
+            return None
+        if torch.version.hip:
+            return None
+        if not self.is_reduction():
+            return None
+        if self.get_reduction_hint() != ReductionHint.INNER:
             return None
 
         nodes = [n for n in self.node_schedule if isinstance(n, SchedulerNode)]
