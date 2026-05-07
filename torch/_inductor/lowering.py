@@ -6861,11 +6861,27 @@ def use_two_step_variance(x, axis, keepdim):
         # 1024 is a default value to pass all the UTs about accuracy.
         # A larger threshold can still get performance benefits.
         threshold = config.cpp.use_two_step_variance_threshold
-    return (
-        isinstance(reduction_numel, sympy.Integer)
-        and int(reduction_numel) <= threshold
-        and sympy_product(ranges) != 1
-    )
+
+    if not (isinstance(reduction_numel, sympy.Integer) and sympy_product(ranges) != 1):
+        return False
+
+    if int(reduction_numel) <= threshold:
+        return True
+
+    # L2-aware check: prefer two-pass when total data fits in L2 cache.
+    # The second pass hits L2 instead of DRAM, and avoids Welford's
+    # per-element division overhead.
+    if device and device.type == "cuda":
+        total_numel = sympy_product(x.get_size())
+        if isinstance(total_numel, sympy.Integer):
+            l2_cache_size = torch.cuda.get_device_properties(
+                device.index or 0
+            ).L2_cache_size
+            total_bytes = int(total_numel) * x.get_dtype().itemsize
+            if total_bytes <= l2_cache_size // 2:
+                return True
+
+    return False
 
 
 def var_mean_welford_(x, axis, *, correction, keepdim, return_mean):

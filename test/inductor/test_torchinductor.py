@@ -6236,6 +6236,21 @@ class CommonTemplate:
 
         self.common(fn, (torch.rand([1, 17, 2048]),))
 
+    @skip_if_not_triton
+    def test_var_mean_l2_aware_two_pass(self):
+        def fn(x):
+            return torch.var_mean(x, dim=-1)
+
+        # Shape small enough to fit in L2/2 — should use two-pass
+        self.common(fn, (torch.randn([1024, 4096]),))
+        # Larger shape — should use Welford
+        self.common(fn, (torch.randn([16384, 16384]),))
+        # Also test with keepdim and correction
+        def fn2(x):
+            return torch.var_mean(x, dim=-1, correction=0, keepdim=True)
+
+        self.common(fn2, (torch.randn([1024, 2048]),))
+
     def test_var_correction(self):
         def fn(x):
             dim = -1
