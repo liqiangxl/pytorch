@@ -15,6 +15,11 @@
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
 
+#if !defined(USE_ROCM) && !defined(_WIN32) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+#include <ATen/native/cuda/TMAScatterAdd.h>
+#define BUILD_TMA_SCATTER_ADD
+#endif
+
 namespace at::native {
 
 // Implement as functors since lambdas don't get optimized.
@@ -576,6 +581,92 @@ void scatter_fill_cuda_kernel(const Tensor& self, int64_t dim, const Tensor& ind
 }
 
 void scatter_add_cuda_kernel(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src) {
+#if defined(BUILD_TMA_SCATTER_ADD)
+  // TMA bulk-reduce fast path for scatter_add_ on Hopper+ (SM90).
+  //
+  // For scatter_add_(dim, index, src) on contiguous nD tensors, we decompose:
+  //   batch dims    = [0, ..., dim-1]     → batch_size
+  //   scatter dim   = dim                 → scatter_size (self) / J (src)
+  //   trailing dims = [dim+1, ..., n-1]   → trailing_size = TMA "row"
+  //
+  // Each trailing slice is contiguous in memory, so TMA can atomically reduce
+  // an entire slice (trailing_size elements) in one cp.reduce.async.bulk op,
+  // replacing trailing_size individual atomicAdd calls.
+  //
+  // The nD problem is reshaped to 2D in the dispatch layer; the kernel itself
+  // always sees (dst[M_flat, D], src[N_flat, D], index_1d[N_flat]).
+  do {
+    auto ndim = self.dim();
+    // Conservative: only trailing-dim contiguity is needed for TMA, but full
+    // contiguity lets us reshape to 2D with flat pointer arithmetic.
+    if (!self.is_contiguous() || !src.is_contiguous()) break;
+    auto dtype = self.scalar_type();
+    // cp.reduce.async.bulk supports .bf16, .f16, and .f32 only.
+    if (dtype != kBFloat16 && dtype != kHalf && dtype != kFloat) break;
+    if (at::cuda::getCurrentDeviceProperties()->major < 9) break;
+
+    // Non-scatter dims must match so we can flatten batch/trailing dims.
+    bool sizes_ok = true;
+    for (int d = 0; d < ndim; d++) {
+      if (d == dim) continue;
+      if (self.size(d) != src.size(d) || self.size(d) != index.size(d)) {
+        sizes_ok = false;
+        break;
+      }
+    }
+    if (!sizes_ok) break;
+
+    // Index must be broadcast (stride 0) on trailing dims so that every element
+    // in a trailing slice maps to the same destination row. This is the pattern
+    // produced by idx_1d.unsqueeze(-1).expand_as(src). A non-broadcast index
+    // means per-element destinations — TMA can't bulk-reduce that.
+    bool index_trailing_broadcast = true;
+    for (int d = dim + 1; d < ndim; d++) {
+      if (index.stride(d) != 0) {
+        index_trailing_broadcast = false;
+        break;
+      }
+    }
+    if (!index_trailing_broadcast) break;
+
+    // TMA requires the transfer size to be a multiple of 16 bytes.
+    int64_t trailing_size = 1;
+    for (int d = dim + 1; d < ndim; d++) {
+      trailing_size *= self.size(d);
+    }
+    if ((trailing_size * src.element_size()) % 16 != 0) break;
+
+    // Pick rows_per_block: largest that fits in device smem while keeping
+    // enough blocks for good SM occupancy.
+    // - Small D + large N: high rpb amortizes mbarrier init (rpb=16 is 5x faster
+    //   than rpb=1 at D=64, N=1M).
+    // - Small N: low rpb gives more blocks for SM utilization (rpb=1 is best
+    //   when N < ~10K).
+    // - Large D: TMA reduce throughput dominates; rpb doesn't matter.
+    size_t row_bytes = trailing_size * src.element_size();
+    int max_smem = at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+    int num_sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    int64_t total_rows = src.numel() / trailing_size;
+    // Want at least 4 blocks per SM for occupancy.
+    int64_t min_blocks = 4L * num_sms;
+    int rows_per_block = 0;
+    for (int rpb : {16, 8, 4, 2, 1}) {
+      // row_bytes is already 16-byte aligned (checked above), so mbarrier
+      // array is naturally 8-byte aligned — no padding needed.
+      size_t smem = rpb * row_bytes + rpb * sizeof(uint64_t);
+      if (static_cast<int>(smem) > max_smem) continue;
+      int64_t num_blocks = (total_rows + rpb - 1) / rpb;
+      if (num_blocks >= min_blocks || rpb == 1) {
+        rows_per_block = rpb;
+        break;
+      }
+    }
+    if (rows_per_block == 0) break;
+
+    tma_scatter_add_dispatch(self, dim, index, src, rows_per_block);
+    return;
+  } while (false);
+#endif
   cuda_scatter_gather_base_kernel</*is_scatter_like=*/true, /*cast_to_opaque=*/false>()(
     self, dim, index, src,
     "scatter_add_cuda_", reduce_add);
