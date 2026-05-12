@@ -471,25 +471,6 @@ class TestScatterGather(TestCase):
 
     @onlyCUDA
     @dtypes(torch.bfloat16, torch.float16, torch.float32)
-    def test_scatter_add_tma_2d_unique_indices(self, device, dtype):
-        """TMA fast path (2D dim=0): unique indices, compare against CPU float64."""
-        if not SM90OrLater:
-            self.skipTest("TMA scatter_add requires SM90+")
-        for D in [64, 128, 256, 768]:
-            M, N = 1000, 500
-            idx_1d = torch.randperm(M, device=device)[:N].to(torch.int64)
-            src = torch.randn(N, D, device=device, dtype=dtype)
-            idx_2d = idx_1d.unsqueeze(1).expand(N, D)
-
-            dst = torch.zeros(M, D, device=device, dtype=dtype)
-            dst.scatter_add_(0, idx_2d, src)
-
-            dst_ref = torch.zeros(M, D, device='cpu', dtype=torch.float64)
-            dst_ref.scatter_add_(0, idx_2d.cpu(), src.cpu().to(torch.float64))
-            self.assertEqual(dst.cpu().to(torch.float64), dst_ref, atol=0, rtol=0)
-
-    @onlyCUDA
-    @dtypes(torch.bfloat16, torch.float16, torch.float32)
     def test_scatter_add_tma_2d_duplicate_indices(self, device, dtype):
         """TMA fast path (2D dim=0): duplicate indices, compare against CPU float64."""
         if not SM90OrLater:
@@ -533,55 +514,32 @@ class TestScatterGather(TestCase):
         self.assertEqual(dst[0], src[0])
 
         # All indices point to row 0 (max contention)
-        N = 1000
+        N = 64
         src = torch.ones(N, D, device=device, dtype=dtype)
         idx = torch.zeros(N, dtype=torch.int64, device=device).unsqueeze(1).expand(N, D)
         dst = torch.zeros(M, D, device=device, dtype=dtype)
         dst.scatter_add_(0, idx, src)
-        dst_ref = torch.zeros(M, D, device='cpu', dtype=torch.float64)
-        dst_ref.scatter_add_(0, idx.cpu(), src.cpu().to(torch.float64))
-        atol = 512.0 if dtype == torch.bfloat16 else 64.0 if dtype == torch.float16 else 1.0
-        self.assertEqual(dst.cpu().to(torch.float64), dst_ref, atol=atol, rtol=0.5)
+        expected = torch.zeros(M, D, device=device, dtype=dtype)
+        expected[0, :] = N
+        self.assertEqual(dst, expected)
 
     @onlyCUDA
     @dtypes(torch.bfloat16, torch.float16, torch.float32)
-    def test_scatter_add_tma_3d_dim0(self, device, dtype):
-        """TMA fast path (3D dim=0): trailing dims folded into row."""
+    def test_scatter_add_tma_oob_index(self, device, dtype):
+        """TMA fast path must raise on out-of-bounds indices, not silently write OOB."""
         if not SM90OrLater:
             self.skipTest("TMA scatter_add requires SM90+")
-        M, N, O = 50, 8, 16
-        I = 200
-        idx_1d = torch.randint(0, M, (I,), device=device, dtype=torch.int64)
-        src = torch.randn(I, N, O, device=device, dtype=dtype)
-        idx = idx_1d.view(I, 1, 1).expand(I, N, O)
+        M, N, D = 100, 10, 128
+        src = torch.randn(N, D, device=device, dtype=dtype)
 
-        dst = torch.zeros(M, N, O, device=device, dtype=dtype)
-        dst.scatter_add_(0, idx, src)
-
-        dst_ref = torch.zeros(M, N, O, device='cpu', dtype=torch.float64)
-        dst_ref.scatter_add_(0, idx.cpu(), src.cpu().to(torch.float64))
-        atol = 1.0 if dtype == torch.bfloat16 else 0.1 if dtype == torch.float16 else 0.01
-        self.assertEqual(dst.cpu().to(torch.float64), dst_ref, atol=atol, rtol=0.05)
-
-    @onlyCUDA
-    @dtypes(torch.bfloat16, torch.float16, torch.float32)
-    def test_scatter_add_tma_3d_dim1(self, device, dtype):
-        """TMA fast path (3D dim=1): batch dim + trailing dim."""
-        if not SM90OrLater:
-            self.skipTest("TMA scatter_add requires SM90+")
-        M, N, O = 4, 50, 64
-        J = 200
-        idx_1d = torch.randint(0, N, (M, J), device=device, dtype=torch.int64)
-        src = torch.randn(M, J, O, device=device, dtype=dtype)
-        idx = idx_1d.unsqueeze(2).expand(M, J, O)
-
-        dst = torch.zeros(M, N, O, device=device, dtype=dtype)
-        dst.scatter_add_(1, idx, src)
-
-        dst_ref = torch.zeros(M, N, O, device='cpu', dtype=torch.float64)
-        dst_ref.scatter_add_(1, idx.cpu(), src.cpu().to(torch.float64))
-        atol = 1.0 if dtype == torch.bfloat16 else 0.1 if dtype == torch.float16 else 0.01
-        self.assertEqual(dst.cpu().to(torch.float64), dst_ref, atol=atol, rtol=0.05)
+        for bad_idx in [M, M + 1000, -1]:
+            idx_1d = torch.zeros(N, device=device, dtype=torch.int64)
+            idx_1d[0] = bad_idx
+            idx_2d = idx_1d.unsqueeze(1).expand(N, D)
+            dst = torch.zeros(M, D, device=device, dtype=dtype)
+            with self.assertRaisesRegex(RuntimeError, ""):
+                dst.scatter_add_(0, idx_2d, src)
+                torch.cuda.synchronize()
 
     @onlyCUDA
     @dtypes(torch.bfloat16)

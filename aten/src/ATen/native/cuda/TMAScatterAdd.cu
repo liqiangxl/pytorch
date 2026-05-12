@@ -3,7 +3,6 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/ops/arange.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #if !defined(USE_ROCM) && !defined(_WIN32) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
@@ -18,25 +17,24 @@ namespace ptx = ::cuda::ptx;
 
 namespace {
 
-template <typename T, int RowsPerBlock>
+template <typename T, typename index_t, int RowsPerBlock>
 __global__ void __launch_bounds__(64)
 tma_scatter_add_kernel(
     T* __restrict__ dst,
     const T* __restrict__ src,
-    const int64_t* __restrict__ index,
-    int N,
-    int D) {
+    const index_t* __restrict__ index,
+    int64_t N,
+    int64_t D,
+    int64_t index_size) {
 #if __CUDA_ARCH__ >= 900
   extern __shared__ char smem_raw[];
   T* smem = reinterpret_cast<T*>(smem_raw);
-  // Row buffer is 16-byte aligned (D * sizeof(T) % 16 == 0), so mbarriers
-  // that follow are naturally 8-byte aligned.
   uint64_t* mbar = reinterpret_cast<uint64_t*>(smem_raw + (size_t)RowsPerBlock * D * sizeof(T));
 
   const int warp_id = threadIdx.x / 32;
   const int lane_id = threadIdx.x % 32;
-  const int row_base = blockIdx.x * RowsPerBlock;
-  const int num_rows = min(RowsPerBlock, N - row_base);
+  const int64_t row_base = (int64_t)blockIdx.x * RowsPerBlock;
+  const int num_rows = static_cast<int>(min((int64_t)RowsPerBlock, N - row_base));
 
   if (threadIdx.x == 0) {
     for (int s = 0; s < RowsPerBlock; s++) {
@@ -48,7 +46,7 @@ tma_scatter_add_kernel(
   if (warp_id == 0) {
     for (int i = 0; i < num_rows; i++) {
       if (lane_id == 0) {
-        int row = row_base + i;
+        int64_t row = row_base + i;
         uint32_t size = D * sizeof(T);
         ptx::mbarrier_arrive_expect_tx(
             ptx::sem_release, ptx::scope_cta, ptx::space_shared, &mbar[i], size);
@@ -68,8 +66,11 @@ tma_scatter_add_kernel(
       __syncwarp();
 
       if (lane_id == 0) {
-        int row = row_base + i;
-        T* dst_ptr = dst + index[row] * D;
+        int64_t row = row_base + i;
+        auto idx_dim = (int64_t)index[row];
+        CUDA_KERNEL_ASSERT(idx_dim >= 0 && idx_dim < index_size
+          && "scatter gather kernel index out of bounds");
+        T* dst_ptr = dst + idx_dim * D;
         ptx::fence_proxy_async(ptx::space_shared);
         ptx::cp_reduce_async_bulk(
             ptx::space_global, ptx::space_shared, ptx::op_add,
@@ -89,34 +90,34 @@ tma_scatter_add_kernel(
 #endif // __CUDA_ARCH__ >= 900
 }
 
-template <typename T, int RowsPerBlock>
+template <typename T, typename index_t, int RowsPerBlock>
 void launch_tma_scatter_add(
     T* dst,
     const T* src,
-    const int64_t* index,
-    int N,
-    int D) {
+    const index_t* index,
+    int64_t N,
+    int64_t D,
+    int64_t index_size) {
   if (N == 0) return;
 
   auto stream = at::cuda::getCurrentCUDAStream();
-  int grid = (N + RowsPerBlock - 1) / RowsPerBlock;
+  int64_t grid = (N + RowsPerBlock - 1) / RowsPerBlock;
+  TORCH_INTERNAL_ASSERT(grid <= at::cuda::getCurrentDeviceProperties()->maxGridSize[0],
+      "TMA scatter_add grid size exceeds device limit");
 
-  // Row buffer is already 16-byte aligned (dispatch guard ensures
-  // D * sizeof(T) % 16 == 0), so mbarrier array is naturally 8-byte aligned.
   size_t smem_bytes = RowsPerBlock * D * sizeof(T)
                     + RowsPerBlock * sizeof(uint64_t);
 
-  // Dynamic smem beyond the device default requires opt-in via cudaFuncSetAttribute.
   int default_smem = at::cuda::getCurrentDeviceProperties()->sharedMemPerBlock;
   if (smem_bytes > static_cast<size_t>(default_smem)) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        tma_scatter_add_kernel<T, RowsPerBlock>,
+        tma_scatter_add_kernel<T, index_t, RowsPerBlock>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         smem_bytes));
   }
 
-  tma_scatter_add_kernel<T, RowsPerBlock><<<grid, 64, smem_bytes, stream>>>(
-      dst, src, index, N, D);
+  tma_scatter_add_kernel<T, index_t, RowsPerBlock><<<static_cast<unsigned int>(grid), 64, smem_bytes, stream>>>(
+      dst, src, index, N, D, index_size);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -126,62 +127,47 @@ void tma_scatter_add_impl(
     int64_t dim,
     const Tensor& index,
     const Tensor& src) {
-  auto ndim = self.dim();
+  // 2D only: self[M, D].scatter_add_(0, index[N, D], src[N, D])
+  //   dst_row = index[row]
+  TORCH_INTERNAL_ASSERT(dim == 0 && self.dim() == 2);
 
-  int64_t batch_size = 1;
-  for (int d = 0; d < dim; d++) {
-    batch_size *= self.size(d);
-  }
-  int64_t scatter_size = self.size(dim);
-  int64_t J = src.size(dim);
-  int64_t trailing_size = 1;
-  for (int d = dim + 1; d < ndim; d++) {
-    trailing_size *= self.size(d);
-  }
+  const int64_t N = src.size(0);
+  const int64_t D = self.size(1);
+  const int64_t index_size = self.size(0);
 
-  // Extract core index: one value per (batch, scatter_idx) combination.
-  // Select index 0 along each trailing dim (all have stride 0 so values are identical).
-  Tensor idx_core = index;
-  for (int d = ndim - 1; d > dim; d--) {
-    idx_core = idx_core.select(d, 0);
-  }
-  idx_core = idx_core.contiguous();
+  // Index has stride 0 on dim 1 (broadcast), so just take column 0.
+  Tensor index_flat = index.select(1, 0).contiguous();
 
-  Tensor index_1d;
-  if (batch_size == 1) {
-    index_1d = idx_core.reshape({-1});
+  auto launch = [&](auto* idx_ptr) {
+    using index_t = std::remove_const_t<std::remove_pointer_t<decltype(idx_ptr)>>;
+    switch (self.scalar_type()) {
+      case at::ScalarType::BFloat16:
+        launch_tma_scatter_add<__nv_bfloat16, index_t, RowsPerBlock>(
+            reinterpret_cast<__nv_bfloat16*>(self.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(src.data_ptr()),
+            idx_ptr, N, D, index_size);
+        break;
+      case at::ScalarType::Half:
+        launch_tma_scatter_add<__half, index_t, RowsPerBlock>(
+            reinterpret_cast<__half*>(self.data_ptr()),
+            reinterpret_cast<const __half*>(src.data_ptr()),
+            idx_ptr, N, D, index_size);
+        break;
+      case at::ScalarType::Float:
+        launch_tma_scatter_add<float, index_t, RowsPerBlock>(
+            reinterpret_cast<float*>(self.data_ptr()),
+            reinterpret_cast<const float*>(src.data_ptr()),
+            idx_ptr, N, D, index_size);
+        break;
+      default:
+        TORCH_INTERNAL_ASSERT(false, "Unsupported dtype for TMA scatter_add");
+    }
+  };
+
+  if (index_flat.scalar_type() == at::kInt) {
+    launch(index_flat.data_ptr<int32_t>());
   } else {
-    auto idx_2d = idx_core.reshape({batch_size, J});
-    auto batch_offsets = at::arange(
-        batch_size, index.options().dtype(at::kLong));
-    batch_offsets.mul_(scatter_size);
-    index_1d = idx_2d.add(batch_offsets.unsqueeze(1)).reshape({-1}).contiguous();
-  }
-
-  const int N = static_cast<int>(batch_size * J);
-  const int D = static_cast<int>(trailing_size);
-
-  switch (self.scalar_type()) {
-    case at::ScalarType::BFloat16:
-      launch_tma_scatter_add<__nv_bfloat16, RowsPerBlock>(
-          reinterpret_cast<__nv_bfloat16*>(self.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(src.data_ptr()),
-          index_1d.data_ptr<int64_t>(), N, D);
-      break;
-    case at::ScalarType::Half:
-      launch_tma_scatter_add<__half, RowsPerBlock>(
-          reinterpret_cast<__half*>(self.data_ptr()),
-          reinterpret_cast<const __half*>(src.data_ptr()),
-          index_1d.data_ptr<int64_t>(), N, D);
-      break;
-    case at::ScalarType::Float:
-      launch_tma_scatter_add<float, RowsPerBlock>(
-          reinterpret_cast<float*>(self.data_ptr()),
-          reinterpret_cast<const float*>(src.data_ptr()),
-          index_1d.data_ptr<int64_t>(), N, D);
-      break;
-    default:
-      TORCH_INTERNAL_ASSERT(false, "Unsupported dtype for TMA scatter_add");
+    launch(index_flat.data_ptr<int64_t>());
   }
 }
 
