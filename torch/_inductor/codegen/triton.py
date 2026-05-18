@@ -104,7 +104,6 @@ from .common import (
     PythonPrinter,
     RemovedArg,
     SizeArg,
-    unbacked_float_dtype,
     TensorArg,
     WorkspaceArg,
     WorkspaceZeroMode,
@@ -3204,15 +3203,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         env: dict[sympy.Symbol, Any] = {}
         index_dtype = self.get_index_dtype_as_torch_dtype()
 
-        def sizevar_dtype(symbol: sympy.Symbol) -> torch.dtype:
-            dtype = (
-                unbacked_float_dtype()
-                if symbol_is_type(symbol, SymT.UNBACKED_FLOAT)
-                else index_dtype
-            )
-            self.args.sizevar_dtypes[symbol] = dtype
-            return dtype
-
         for symbol in sorted(index.free_symbols, key=operator.attrgetter("name")):
             assert isinstance(symbol, sympy.Symbol)
             if symbol_is_type(symbol, SymT.TMP):
@@ -3230,7 +3220,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 env[symbol] = self.create_cse_var(
                     name,
                     ValueRanges.unknown(),
-                    sizevar_dtype(symbol),
+                    self.args.sizevar_dtypes[symbol],
                     (),
                 )
             elif symbol_is_type(symbol, SymT.FLOAT):

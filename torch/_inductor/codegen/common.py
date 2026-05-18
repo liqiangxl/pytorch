@@ -68,6 +68,15 @@ def unbacked_float_dtype() -> torch.dtype:
     return torch.float32
 
 
+def integer_sizevar_dtype(arg_name: str) -> torch.dtype:
+    if config.triton.use_block_ptr and arg_name.startswith("ks"):
+        try:
+            return V.kernel.get_index_dtype_as_torch_dtype()
+        except AttributeError:
+            pass
+    return torch.int64
+
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, MutableMapping, Sequence
 
@@ -1745,11 +1754,13 @@ class KernelArgs:
             self.sizevars[name] = "seed"  # don't manage the name of seeds
             self.sizevar_dtypes.setdefault(name, torch.int64)
             return "seed"
+
+        arg_name = self._lookup("ks", self.sizevars, name)
         if symbol_is_type(name, SymT.UNBACKED_FLOAT):
             self.sizevar_dtypes.setdefault(name, unbacked_float_dtype())
         else:
-            self.sizevar_dtypes.setdefault(name, torch.int64)
-        return self._lookup("ks", self.sizevars, name)
+            self.sizevar_dtypes.setdefault(name, integer_sizevar_dtype(arg_name))
+        return arg_name
 
     def call_names(self) -> Iterator[str]:
         return chain(

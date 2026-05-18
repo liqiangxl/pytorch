@@ -69,6 +69,30 @@ class TestCodegenTriton(InductorTestCase):
             args.size(symbol)
             self.assertEqual(args.sizevar_dtypes[symbol], torch.float32)
 
+    def test_kernel_args_integer_size_respects_block_ptr_index_dtype(self):
+        class FakeKernel:
+            @staticmethod
+            def get_index_dtype_as_torch_dtype():
+                return torch.int32
+
+        symbol = make_symbol(SymT.SIZE, 0)
+
+        with (
+            inductor_config.patch("triton.use_block_ptr", True),
+            V.set_kernel_handler(FakeKernel()),
+        ):
+            args = KernelArgs()
+            self.assertEqual(args.size(symbol), "ks0")
+            self.assertEqual(args.sizevar_dtypes[symbol], torch.int32)
+
+        with (
+            inductor_config.patch("triton.use_block_ptr", False),
+            V.set_kernel_handler(FakeKernel()),
+        ):
+            args = KernelArgs()
+            args.size(symbol)
+            self.assertEqual(args.sizevar_dtypes[symbol], torch.int64)
+
     def test_range_tree_entry_ownership_uses_root_identity(self):
         class AlternateR0Root(IterationRangesRoot):
             def block_size(self):
