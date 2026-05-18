@@ -104,6 +104,7 @@ from .common import (
     PythonPrinter,
     RemovedArg,
     SizeArg,
+    unbacked_float_dtype,
     TensorArg,
     WorkspaceArg,
     WorkspaceZeroMode,
@@ -3204,15 +3205,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         index_dtype = self.get_index_dtype_as_torch_dtype()
 
         def sizevar_dtype(symbol: sympy.Symbol) -> torch.dtype:
-            if symbol_is_type(symbol, SymT.UNBACKED_FLOAT):
-                dtype = (
-                    torch.float64
-                    if config._use_fp64_for_unbacked_floats
-                    and device_supports_fp64(V.graph.current_device)
-                    else torch.float32
-                )
-            else:
-                dtype = index_dtype
+            dtype = (
+                unbacked_float_dtype()
+                if symbol_is_type(symbol, SymT.UNBACKED_FLOAT)
+                else index_dtype
+            )
             self.args.sizevar_dtypes[symbol] = dtype
             return dtype
 

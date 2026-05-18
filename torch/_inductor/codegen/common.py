@@ -38,6 +38,7 @@ from ..shape_propagation import ShapePropagationOpsHandler
 from ..utils import (
     boolean_ops,
     DeferredLineBase,
+    device_supports_fp64,
     generate_assert,
     get_current_backend,
     IndentedBuffer,
@@ -58,6 +59,13 @@ from ..virtualized import (
     StoreMode,
     V,
 )
+
+
+def unbacked_float_dtype() -> torch.dtype:
+    current_device = getattr(V.graph, "current_device", None)
+    if config._use_fp64_for_unbacked_floats and device_supports_fp64(current_device):
+        return torch.float64
+    return torch.float32
 
 
 if TYPE_CHECKING:
@@ -1738,7 +1746,7 @@ class KernelArgs:
             self.sizevar_dtypes.setdefault(name, torch.int64)
             return "seed"
         if symbol_is_type(name, SymT.UNBACKED_FLOAT):
-            self.sizevar_dtypes.setdefault(name, torch.float32)
+            self.sizevar_dtypes.setdefault(name, unbacked_float_dtype())
         else:
             self.sizevar_dtypes.setdefault(name, torch.int64)
         return self._lookup("ks", self.sizevars, name)
