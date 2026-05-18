@@ -8734,6 +8734,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         out, _ = run_and_get_code(torch.compile(fn, dynamic=True), x)
         self.assertEqual(fn(x), out)
 
+    @requires_gpu()
+    @config.patch("test_configs.runtime_triton_dtype_assert", True)
+    @config.patch("test_configs.runtime_triton_shape_assert", True)
+    def test_dynamic_index_expr_sympy_interp_handlers(self):
+        def fn(x):
+            # Keep the integer additions/subtractions here: this covers the
+            # sympy_interp sym_sum fastpath along with PowByNatural and PythonMod.
+            pow_term = 2 ** (math.floor(math.log2(x.shape[0]) + 1))
+            mod_term = (x.shape[0] - 10) % x.shape[0]
+            return x + pow_term + mod_term
+
+        x = torch.arange(10, device=GPU_TYPE, dtype=torch.float32)
+        out, _ = run_and_get_code(torch.compile(fn, dynamic=True), x)
+        self.assertEqual(fn(x), out)
+
     def test_sort(self):
         def fn(a, descending):
             return torch.sort(a)

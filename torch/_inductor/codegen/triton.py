@@ -2136,6 +2136,35 @@ class TritonOverrides(OpOverrides):
                 result = f"{result}.to({triton_type(result_dtype)})"
         return result
 
+    @classmethod
+    def pow_by_natural(cls, a, b):
+        result_dtype = get_dtype_handler().pow_by_natural(a, b)
+        any_needs_upcast = needs_upcast_to_float32(a) or needs_upcast_to_float32(b)
+        pow_dtype = result_dtype
+        if pow_dtype not in (torch.float32, torch.float64):
+            pow_dtype = (
+                torch.float32
+                if low_precision_fp(result_dtype) or any_needs_upcast
+                else torch.float64
+            )
+        if pow_dtype == torch.float64 and not device_supports_fp64(
+            V.graph.current_device
+        ):
+            pow_dtype = torch.float32
+            if result_dtype == torch.float64:
+                result_dtype = torch.float32
+
+        cast_a = cls._cast_libdevice_arg(a, pow_dtype)
+        cast_b = cls._cast_libdevice_arg(b, pow_dtype)
+        result = f"libdevice.pow({cast_a}, {cast_b})"
+        if result_dtype is not None and result_dtype != pow_dtype:
+            result = f"{result}.to({triton_type(result_dtype)})"
+        return result
+
+    @staticmethod
+    def python_mod(a, b):
+        return f"triton_helpers.remainder_integer({a}, {b})"
+
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
