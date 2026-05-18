@@ -1571,6 +1571,7 @@ class KernelArgs:
         self.output_buffers: dict[str, str | RemovedArg] = {}
         self.inplace_buffers: dict[str, InplacedBuffer | RemovedArg] = {}
         self.sizevars: dict[sympy.Expr, str] = {}
+        self.sizevar_dtypes: dict[sympy.Expr, torch.dtype] = {}
         self.workspace_args: list[WorkspaceArg] = []
 
     def __repr__(self) -> str:
@@ -1727,13 +1728,19 @@ class KernelArgs:
                 f"{name}{sum(1 for v in self.sizevars.values() if v.startswith(name))}"
             )
         self.sizevars[value] = name
+        self.sizevar_dtypes.setdefault(value, torch.int64)
         return name
 
     def size(self, name: sympy.Symbol) -> str:
         assert isinstance(name, sympy.Symbol), (type(name), name)
         if name.name == "seed":
             self.sizevars[name] = "seed"  # don't manage the name of seeds
+            self.sizevar_dtypes.setdefault(name, torch.int64)
             return "seed"
+        if symbol_is_type(name, SymT.UNBACKED_FLOAT):
+            self.sizevar_dtypes.setdefault(name, torch.float32)
+        else:
+            self.sizevar_dtypes.setdefault(name, torch.int64)
         return self._lookup("ks", self.sizevars, name)
 
     def call_names(self) -> Iterator[str]:
@@ -2657,7 +2664,7 @@ class CSEProxy(DefaultHandler):
         output_dtype = None
         output_shape = None
 
-        if name == "masked" and backend == "triton":
+        if name in ("masked", "index_expr") and backend == "triton":
             output_dtype = value.dtype
             output_shape = value.shape
         elif name == "masked" and backend == "cpp":

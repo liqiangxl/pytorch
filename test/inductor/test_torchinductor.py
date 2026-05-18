@@ -8723,6 +8723,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         x = torch.arange(10)
         self.common(fn, (x,))
 
+    @requires_gpu()
+    @config.patch("test_configs.runtime_triton_dtype_assert", True)
+    @config.patch("test_configs.runtime_triton_shape_assert", True)
+    def test_dynamic_index_expr_dtype_asserts(self):
+        def fn(x):
+            return x + 1.0 / x.size(0)
+
+        x = torch.arange(10, device=GPU_TYPE)
+        out, _ = run_and_get_code(torch.compile(fn, dynamic=True), x)
+        self.assertEqual(fn(x), out)
+
     def test_sort(self):
         def fn(a, descending):
             return torch.sort(a)

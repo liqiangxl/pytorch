@@ -28,6 +28,7 @@ from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.utils import identity, preserve_rng_state
 from torch._prims_common import is_integer_dtype, type_to_dtype
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.interp import sympy_interp
 from torch.utils._sympy.functions import (
     CeilDiv,
     FloorDiv,
@@ -2299,57 +2300,33 @@ class TritonKernelOverrides(TritonOverrides):
         )
         assert isinstance(indexing, IndexingOptions)
 
-        shape: BlockShapeType
-        if indexing.expand_shape:
-            shape = indexing.expand_shape
-        else:
-            shape = TritonSymbols.get_block_shape(indexing.index)
-
-        # Our sympy expr printing casts to the current kernel index dtype.
-        # we only respect non int32-int64 dtypes and otherwise use current kernel indexing dtype
         index_dtype = V.kernel.get_index_dtype_as_torch_dtype()
-        dtype = dtype if dtype not in (torch.int32, torch.int64) else index_dtype
+        target_dtype = dtype if dtype not in (torch.int32, torch.int64) else index_dtype
 
-        # after we emit this var we cast it to the correct dtype
-        orig = config.test_configs.runtime_triton_dtype_assert
-        try:
-            config.test_configs.runtime_triton_dtype_assert = False
+        var = sympy_interp(
+            ops,
+            V.kernel.sympy_interp_env(indexing.index),
+            indexing.index,
+            index_dtype=index_dtype,
+        )
+
+        if indexing.expand_shape and tuple(var.shape) != tuple(indexing.expand_shape):
+            assert indexing.expand_str is not None
             var = V.kernel.cse.generate(
                 V.kernel.compute,
-                indexing.index_str,
+                f"tl.broadcast_to({var}, {indexing.expand_str})",
                 bounds=get_bounds_index_expr(expr),
-                dtype=dtype,
-                shape=shape,
+                dtype=var.dtype,
+                shape=indexing.expand_shape,
             )
-        finally:
-            config.test_configs.runtime_triton_dtype_assert = orig
 
-        if dtype not in (torch.int32, torch.int64):
+        if var.dtype != upcast_compute_type(target_dtype):
             var = V.kernel.cse.generate(
                 V.kernel.compute,
-                cls.to_dtype(var, dtype),
-                dtype=upcast_compute_type(dtype),
+                cls.to_dtype(var, target_dtype),
+                dtype=upcast_compute_type(target_dtype),
                 shape=var.shape,
             )
-        else:
-            # TODO: we are not always consistent in enforcing that the output of the index expr printing
-            # results in the indexing dtype. So if we detect that we have an input which might type promote
-            # to a dtype other than indexing dtype, add a cast.
-            # Trying to avoid
-            dtype = index_dtype
-            for index_var in expr.free_symbols:
-                if symbol_is_type(index_var, SymT.TMP):
-                    dtype = torch.promote_types(
-                        dtype, V.kernel.cse.varname_map[index_var.name].dtype
-                    )
-
-            if dtype != index_dtype:
-                var = V.kernel.cse.generate(
-                    V.kernel.compute,
-                    cls.to_dtype(var, index_dtype),
-                    dtype=index_dtype,
-                    shape=var.shape,
-                )
 
         var.mask_vars = indexing.mask_vars
         return var
@@ -3192,6 +3169,72 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     @property
     def assert_function(self) -> str:
         return "tl.device_assert"
+
+    def sympy_interp_env(self, index: sympy.Expr) -> dict[sympy.Symbol, Any]:
+        env: dict[sympy.Symbol, Any] = {}
+        index_dtype = self.get_index_dtype_as_torch_dtype()
+
+        def sizevar_dtype(symbol: sympy.Symbol) -> torch.dtype:
+            if symbol_is_type(symbol, SymT.UNBACKED_FLOAT):
+                dtype = (
+                    torch.float64
+                    if config._use_fp64_for_unbacked_floats
+                    and device_supports_fp64(V.graph.current_device)
+                    else torch.float32
+                )
+            else:
+                dtype = index_dtype
+            self.args.sizevar_dtypes[symbol] = dtype
+            return dtype
+
+        for symbol in sorted(index.free_symbols, key=operator.attrgetter("name")):
+            assert isinstance(symbol, sympy.Symbol)
+            if symbol_is_type(symbol, SymT.TMP):
+                env[symbol] = self.cse.varname_map[symbol.name]
+            elif symbol_is_type(
+                symbol,
+                (
+                    SymT.UNBACKED_INT,
+                    SymT.SIZE,
+                    SymT.PRECOMPUTED_SIZE,
+                    SymT.UNBACKED_FLOAT,
+                ),
+            ):
+                name = self.args.size(symbol)
+                env[symbol] = self.create_cse_var(
+                    name,
+                    ValueRanges.unknown(),
+                    sizevar_dtype(symbol),
+                    (),
+                )
+            elif symbol_is_type(symbol, SymT.FLOAT):
+                env[symbol] = self.create_cse_var(
+                    symbol.name,
+                    ValueRanges.unknown(),
+                    torch.float64,
+                    (),
+                )
+            elif symbol_is_type(symbol, SymT.INDEX):
+                env[symbol] = self.create_cse_var(
+                    symbol.name,
+                    ValueRanges.unknown(),
+                    index_dtype,
+                    (),
+                )
+            else:
+                shape = (
+                    TritonSymbols.get_block_shape(symbol)
+                    if symbol in self.range_tree_nodes
+                    else ()
+                )
+                env[symbol] = self.create_cse_var(
+                    symbol.name,
+                    ValueRanges.unknown(),
+                    index_dtype,
+                    shape,
+                )
+
+        return env
 
     def indexing(
         self,
