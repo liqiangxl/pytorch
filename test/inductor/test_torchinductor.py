@@ -8735,6 +8735,24 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(fn(x), out)
 
     @requires_gpu()
+    @config.patch("triton.dense_indexing", True)
+    @config.patch("test_configs.runtime_triton_shape_assert", True)
+    def test_index_expr_preserves_indexing_expand_shape(self):
+        def fn(x):
+            # cummax returns the scan index via ops.index_expr(idx[axis], ...).
+            # Dense indexing requires that scalar scan index to be broadcast to
+            # the full Triton scan shape.
+            return torch.cummax(x, 1)[1]
+
+        x = torch.randn(4, 5, device=GPU_TYPE)
+        out, codes = run_and_get_code(torch.compile(fn), x)
+        self.assertEqual(fn(x), out)
+        self.assertRegex(
+            "\n".join(codes),
+            r"tl\.broadcast_to\(r0_\d+, \[XBLOCK, R0_BLOCK\]\)",
+        )
+
+    @requires_gpu()
     @config.patch("test_configs.runtime_triton_dtype_assert", True)
     @config.patch("test_configs.runtime_triton_shape_assert", True)
     def test_dynamic_index_expr_sympy_interp_handlers(self):
