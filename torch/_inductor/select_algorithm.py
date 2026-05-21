@@ -4724,19 +4724,45 @@ class AlgorithmSelectorCache(PersistentCache):
             input_gen_fns = {}
 
         # de-duplicate args
-        unique_example_inputs = {
-            x.get_name(): input_gen_fns.get(
-                i,
-                lambda x: cls.benchmark_example_value(x, hint_override=hint_override),
-                # pyrefly: ignore [bad-argument-type]
-            )(x)
-            for i, x in enumerate(input_nodes)
-        }
+        unique_example_inputs = {}
+        for i, x in enumerate(input_nodes):
+            if isinstance(x, ir.GluonTensorDescriptor):
+                from triton.experimental.gluon import language as _ttgl
+                from triton.experimental.gluon.nvidia.hopper import (
+                    TensorDescriptor as _GluonTD,
+                )
+
+                tensor_node = x.get_tensor()
+                t = cls.benchmark_example_value(
+                    tensor_node, hint_override=hint_override
+                )
+                shared_layout_str = x.shared_layout
+                if shared_layout_str.startswith("NVMMASharedLayout("):
+                    shared_layout = eval(  # noqa: S307
+                        f"_ttgl.{shared_layout_str}"
+                    )
+                else:
+                    shared_layout = shared_layout_str
+                unique_example_inputs[x.get_name()] = _GluonTD.from_tensor(
+                    t, x.block_shape, shared_layout
+                )
+            else:
+                gen_fn = input_gen_fns.get(
+                    i,
+                    lambda x: cls.benchmark_example_value(
+                        x, hint_override=hint_override
+                    ),
+                )
+                unique_example_inputs[x.get_name()] = gen_fn(x)
+
         example_inputs = list(unique_example_inputs.values())
         example_inputs_extern = []
 
         for i, input_node in enumerate(input_nodes):
-            if unique_example_inputs[input_node.get_name()].is_mkldnn:
+            example_val = unique_example_inputs[input_node.get_name()]
+            if not isinstance(example_val, torch.Tensor):
+                example_inputs_extern.append(example_val)
+            elif example_val.is_mkldnn:
                 example_inputs_extern.append(
                     unique_example_inputs[input_node.get_name()]
                 )
@@ -4856,7 +4882,7 @@ class AlgorithmSelectorCache(PersistentCache):
         output.zero_()
         result = choice.benchmark(*inputs, out=output)
         device_type = next(
-            (tensor.device.type for tensor in inputs if is_gpu(tensor.device.type)),
+            (tensor.device.type for tensor in inputs if isinstance(tensor, torch.Tensor) and is_gpu(tensor.device.type)),
             "cuda",
         )
         device_interface = get_interface_for_device(device_type)

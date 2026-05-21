@@ -160,21 +160,24 @@ def tuned_rms_norm(x, weight, *, eps: float = 1e-6, layout=None):
         GLUON_RMS_NORM_LAYOUT,
     )
 
-    r_block, num_warps = _best_config(n)
+    configs = _get_autotune_configs(n)
+    if not configs:
+        raise NotImplementedError("no valid Gluon RMSNorm TMA-smem configs")
 
     choices: list[ir.ChoiceCaller] = []
-    gluon_rms_norm_template.maybe_append_choice(
-        choices,
-        input_nodes=(x_desc, weight),
-        layout=layout,
-        num_stages=3,
-        num_warps=num_warps,
-        prefix_args=1,
-        BLOCK_N=n,
-        R_BLOCK=r_block,
-        EPS=eps,
-        ACC_TYPE="tl.float32",
-    )
+    for r_block, num_warps in configs:
+        gluon_rms_norm_template.maybe_append_choice(
+            choices,
+            input_nodes=(x_desc, weight),
+            layout=layout,
+            num_stages=3,
+            num_warps=num_warps,
+            prefix_args=1,
+            BLOCK_N=n,
+            R_BLOCK=r_block,
+            EPS=eps,
+            ACC_TYPE="tl.float32",
+        )
 
     if not choices:
         raise NotImplementedError("no valid Gluon RMSNorm TMA-smem configs")

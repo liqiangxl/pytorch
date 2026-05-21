@@ -384,6 +384,7 @@ class TensorMeta:
     strides: torch._prims_common.StrideType
     offset: int
     name: str | None = None
+    gluon_descriptor_meta: tuple[list[int], str] | None = None
 
     @classmethod
     def from_irnodes(
@@ -400,6 +401,11 @@ class TensorMeta:
         if isinstance(node, ir.Layout):
             node = ir.Buffer(name="fake", layout=node)
 
+        gluon_meta = None
+        if isinstance(node, ir.GluonTensorDescriptor):
+            gluon_meta = (node.block_shape, node.shared_layout)
+            node = node.get_tensor()
+
         dtype = node.get_dtype()
         assert dtype is not None
         device = node.get_device()
@@ -414,16 +420,30 @@ class TensorMeta:
             ),
             offset=V.graph.sizevars.optimization_hint(node.get_layout().offset),
             name=node.get_name(),
+            gluon_descriptor_meta=gluon_meta,
         )
 
     def to_tensor(self) -> torch.Tensor:
-        return rand_strided(
+        t = rand_strided(
             self.sizes,
             self.strides,
             device=self.device,
             dtype=self.dtype,
             extra_size=self.offset,
         )
+        if self.gluon_descriptor_meta is not None:
+            from triton.experimental.gluon import language as _ttgl
+            from triton.experimental.gluon.nvidia.hopper import (
+                TensorDescriptor as _GluonTD,
+            )
+
+            block_shape, shared_layout_str = self.gluon_descriptor_meta
+            if shared_layout_str.startswith("NVMMASharedLayout("):
+                shared_layout = eval(f"_ttgl.{shared_layout_str}")  # noqa: S307
+            else:
+                shared_layout = shared_layout_str
+            return _GluonTD.from_tensor(t, block_shape, shared_layout)
+        return t
 
 
 @dataclasses.dataclass
@@ -586,7 +606,7 @@ class GPUDeviceBenchmarkMixin:
             (
                 tensor.device.type
                 for tensor in input_tensors
-                if is_gpu(tensor.device.type)
+                if isinstance(tensor, torch.Tensor) and is_gpu(tensor.device.type)
             ),
             "cuda",
         )
