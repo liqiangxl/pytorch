@@ -103,6 +103,12 @@ def signature_of(arg: KernelArgType, *, size_dtype: str | None) -> str:
     if isinstance(arg, TMADescriptorArg):
         if arg.api_type == "experimental":
             return "nvTmaDesc"
+        elif arg.api_type == "gluon":
+            assert arg.block_shape is not None
+            assert arg.dtype is not None
+            assert arg.layout is not None
+            inner = _type_of(arg.dtype)[1:]  # strip the `*`: *fp32 -> fp32
+            return f"tensordesc<{inner}{list(arg.block_shape)},{arg.layout}>"
         else:
             # https://github.com/triton-lang/triton/blob/9695baed9b46cf957e08b157bb4133f4a4b331c5/python/triton/runtime/jit.py#L360-L363
             assert arg.api_type == "stable"

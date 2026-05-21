@@ -2011,8 +2011,26 @@ class PythonWrapperCodegen(CodeGen):
         call = f"{fn}({args})"
         return call
 
+    def _generate_tma_descriptor_call_gluon(self, desc, apply_size_hints=False):
+        block_shape = desc.block_shape
+        if apply_size_hints:
+            block_shape = V.graph.sizevars.optimization_hints(block_shape)
+
+        self.add_import_once("from triton.experimental.gluon import language as _ttgl")
+        self.add_import_once(
+            "from triton.experimental.gluon.nvidia.hopper import "
+            "TensorDescriptor as _GluonTensorDescriptor"
+        )
+        shared_layout = desc.shared_layout
+        if shared_layout.startswith("NVMMASharedLayout("):
+            shared_layout = f"_ttgl.{shared_layout}"
+        args = f"{desc.tensor.codegen_reference()}, {block_shape}, {shared_layout}"
+        return f"_GluonTensorDescriptor.from_tensor({args})"
+
     def _generate_tma_descriptor_call(self, desc, apply_size_hints=False):
-        if isinstance(desc, ir.TMADescriptorExperimental):
+        if isinstance(desc, ir.GluonTensorDescriptor):
+            return self._generate_tma_descriptor_call_gluon(desc, apply_size_hints)
+        elif isinstance(desc, ir.TMADescriptorExperimental):
             return self._generate_tma_descriptor_call_experimental(
                 desc, apply_size_hints
             )
@@ -2890,11 +2908,19 @@ class PythonWrapperCodegen(CodeGen):
                 add_arg(idx, ConstexprArg(name=key), equals_none=True)
             else:
                 if isinstance(arg, ir.TMADescriptor):
-                    api_type, block_shape, dtype = (
-                        ("stable", arg.block_shape, arg.tensor.get_dtype())
-                        if isinstance(arg, ir.TMADescriptorStable)
-                        else ("experimental", None, None)
-                    )
+                    if isinstance(arg, ir.GluonTensorDescriptor):
+                        api_type, block_shape, dtype, layout = (
+                            "gluon",
+                            arg.block_shape,
+                            arg.tensor.get_dtype(),
+                            arg.shared_layout,
+                        )
+                    else:
+                        api_type, block_shape, dtype, layout = (
+                            ("stable", arg.block_shape, arg.tensor.get_dtype(), None)
+                            if isinstance(arg, ir.TMADescriptorStable)
+                            else ("experimental", None, None, None)
+                        )
                     add_arg(
                         idx,
                         TMADescriptorArg(
@@ -2902,6 +2928,7 @@ class PythonWrapperCodegen(CodeGen):
                             api_type=api_type,
                             block_shape=block_shape,
                             dtype=dtype,
+                            layout=layout,
                         ),
                     )
                 elif isinstance(arg, ir.Buffer):

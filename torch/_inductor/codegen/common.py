@@ -296,9 +296,10 @@ class ConstexprArg:
 @dataclasses.dataclass
 class TMADescriptorArg:
     name: str
-    api_type: str  # "experimental" or "stable"
-    block_shape: list[sympy.Expr] | None  # only needed for "stable"
-    dtype: torch.dtype | None  # only needed for "stable"
+    api_type: str  # "experimental", "stable", or "gluon"
+    block_shape: list[sympy.Expr] | None  # only needed for "stable"/"gluon"
+    dtype: torch.dtype | None  # only needed for "stable"/"gluon"
+    layout: str | None = None  # only needed for "gluon"
 
 
 @dataclasses.dataclass
@@ -1842,14 +1843,40 @@ class KernelArgs:
                 continue
             arg_defs.append(ArgName(inner))
             call_args.append(outer)
-            arg_types.append(V.graph.get_dtype(outer))
-            precompile_args.append(
-                TensorArg(
-                    name=inner,
-                    buffer=outer,
-                    dtype=V.graph.get_dtype(outer),
+            dtype = V.graph.get_dtype(outer)
+            arg_types.append(dtype)
+
+            from .. import ir
+
+            buffer = V.graph.try_get_buffer(outer)
+            if isinstance(buffer, ir.TMADescriptor):
+                if isinstance(buffer, ir.GluonTensorDescriptor):
+                    precompile_args.append(
+                        TMADescriptorArg(
+                            name=inner,
+                            api_type="gluon",
+                            block_shape=buffer.block_shape,
+                            dtype=buffer.tensor.get_dtype(),
+                            layout=buffer.shared_layout,
+                        )
+                    )
+                else:
+                    api_type, block_shape, desc_dtype = (
+                        ("stable", buffer.block_shape, buffer.tensor.get_dtype())
+                        if isinstance(buffer, ir.TMADescriptorStable)
+                        else ("experimental", None, None)
+                    )
+                    precompile_args.append(
+                        TMADescriptorArg(inner, api_type, block_shape, desc_dtype)
+                    )
+            else:
+                precompile_args.append(
+                    TensorArg(
+                        name=inner,
+                        buffer=outer,
+                        dtype=dtype,
+                    )
                 )
-            )
         for outer, inner in self.sizevars.items():
             arg_defs.append(ArgName(inner))
             call_args.append(outer)

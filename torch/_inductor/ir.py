@@ -7572,7 +7572,9 @@ class TMADescriptor(ExternKernel):
         cls, tensor: IRNode, tma_meta: tuple[str, tuple[Any, ...]]
     ) -> TMADescriptor:
         assert len(tma_meta) == 2
-        if tma_meta[0] == "experimental":
+        if tma_meta[0] == "gluon":
+            return GluonTensorDescriptor(tensor, *tma_meta[1])
+        elif tma_meta[0] == "experimental":
             return TMADescriptorExperimental(tensor, *tma_meta[1])
         else:
             assert tma_meta[0] == "stable"
@@ -7672,6 +7674,25 @@ class TMADescriptorStable(TMADescriptor):
             tensor=tensor,
             inputs=[tensor],
             constant_args=block_shape,
+        )
+
+
+class GluonTensorDescriptor(TMADescriptor):
+    """
+    Host-side Gluon TensorDescriptor for kernels that need the descriptor's
+    shared-memory layout in the JIT signature.
+    """
+
+    def __init__(
+        self, tensor: IRNode, block_shape: list[int | torch.SymInt], shared_layout: str
+    ):
+        self.block_shape = block_shape
+        self.shared_layout = shared_layout
+
+        super().__init__(
+            tensor=tensor,
+            inputs=[tensor],
+            constant_args=[*block_shape, shared_layout],
         )
 
 

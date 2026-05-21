@@ -1,0 +1,52 @@
+{{def_kernel("x_desc", "w_ptr")}}
+    M = {{size(None, 0)}}
+    N = {{size(None, 1)}}
+    if M * N == 0:
+        return
+
+    NUM_TILES: _ttgl.constexpr = BLOCK_N // R_BLOCK
+    row = _ttgl.program_id(0)
+
+    nw: _ttgl.constexpr = _ttgl.num_warps()
+    tile_layout: _ttgl.constexpr = _ttgl.BlockedLayout(
+        size_per_thread=[R_BLOCK // (nw * 32)],
+        threads_per_warp=[32],
+        warps_per_cta=[nw],
+        order=[0],
+    )
+
+    smem_2d = _ttgl.allocate_shared_memory(
+        _ttgl.bfloat16, [1, BLOCK_N], x_desc.layout
+    )
+    bar = _ttgl.allocate_shared_memory(
+        _ttgl.int64, [1], _mbarrier.MBarrierLayout()
+    )
+    _mbarrier.init(bar, count=1)
+    _mbarrier.expect(bar, 1 * BLOCK_N * 2)
+    _tma.async_copy_global_to_shared(x_desc, [row, 0], bar, smem_2d)
+
+    _mbarrier.wait(bar, phase=0)
+    _mbarrier.invalidate(bar)
+
+    x_smem = smem_2d.reshape([BLOCK_N])
+
+    acc = _ttgl.zeros([R_BLOCK], _ttgl.float32, tile_layout)
+    for t in tl.static_range(0, NUM_TILES):
+        tile = x_smem.slice(t * R_BLOCK, R_BLOCK, dim=0)
+        x_fp32 = tile.load(tile_layout).to(_ttgl.float32)
+        acc += x_fp32 * x_fp32
+
+    total = _ttgl.sum(acc, axis=0)
+    rstd = _ttgl.rsqrt(total / BLOCK_N + EPS)
+
+    for t in tl.static_range(0, NUM_TILES):
+        x_tile = x_smem.slice(t * R_BLOCK, R_BLOCK, dim=0)
+        x_fp32 = x_tile.load(tile_layout).to(_ttgl.float32)
+
+        r_off = t * R_BLOCK
+        w_cols = _ttgl.arange(0, R_BLOCK, tile_layout) + r_off
+        w_fp32 = tl.load(w_ptr + w_cols, eviction_policy="evict_last").to(_ttgl.float32)
+
+        result = x_fp32 * rstd * w_fp32
+        out_cols = _ttgl.arange(0, R_BLOCK, tile_layout) + r_off
+        {{store_output(("row", "out_cols"), "result", indent_width=8, val_shape=("R_BLOCK",))}}

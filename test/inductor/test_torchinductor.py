@@ -15774,6 +15774,35 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         else:
             FileCheck().check("torch.ops.aten._fused_rms_norm.default(").run(codes[0])
 
+    @skipIfRocm
+    @skipIfXpu(msg="Gluon RMSNorm TMA-smem is CUDA-only")
+    @unittest.skipIf(not SM90OrLater, "Gluon RMSNorm TMA-smem requires SM90+")
+    def test_gluon_rms_norm_tma_smem_epilogue_fusion(self):
+        if self.device != GPU_TYPE or config.cpp_wrapper:
+            raise unittest.SkipTest("requires CUDA Python wrapper")
+        try:
+            import triton.experimental.gluon  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("requires Triton Gluon")
+
+        def f(x, weight, bias):
+            y, _ = torch.ops.aten._fused_rms_norm.default(
+                x, [x.shape[-1]], weight, 1e-6
+            )
+            return y + bias
+
+        x = torch.randn(2, 4096, device=self.device, dtype=torch.bfloat16)
+        weight = torch.randn(4096, device=self.device, dtype=torch.bfloat16)
+        bias = torch.randn(4096, device=self.device, dtype=torch.bfloat16)
+
+        result, code = run_and_get_code(torch.compile(f), x, weight, bias)
+        expected = f(x, weight, bias)
+        self.assertTrue(same(result, expected, tol=1e-2))
+        FileCheck().check("@_gluon.jit").check(
+            "_tma.async_copy_global_to_shared"
+        ).run(code[0])
+        self.assertEqual(code[0].count(".run("), 1)
+
     def test_lite_regional_compile_flex_attention(self):
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")

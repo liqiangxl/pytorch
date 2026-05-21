@@ -128,6 +128,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.squeeze,  # inductor lowers this directly
     aten.sum,  # inductor lowers this directly
     aten.unbind,  # inductor lowers this directly
+    aten._fused_rms_norm,  # inductor lowers this directly for Gluon RMSNorm
     aten.baddbmm,  # upcasts to fp32, perf issue
     # FMA ops - we have lowerings that use FMA to match eager CUDA behavior
     aten.addcmul,

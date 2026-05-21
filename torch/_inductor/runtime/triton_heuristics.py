@@ -1055,8 +1055,13 @@ class CachingAutotuner(KernelInterface):
         if not ASTSource:
             raise RuntimeError("Installed triton version too old, please upgrade")
 
+        ast_source = getattr(self.fn, "ASTSource", ASTSource)
+        if getattr(self.fn, "is_gluon", lambda: False)():
+            from triton.experimental.gluon._runtime import GluonASTSource
+
+            ast_source = GluonASTSource
         compile_args = (
-            ASTSource(
+            ast_source(
                 self.fn,
                 compile_meta["signature"],
                 compile_meta["constants"],
@@ -2315,6 +2320,9 @@ class StaticTritonCompileResult(CompileResult[_T]):
         heuristic_type: HeuristicType,
     ) -> _KernelType | None:
         if not torch._inductor.config.use_static_triton_launcher:
+            return None
+
+        if getattr(getattr(kernel.src, "fn", None), "is_gluon", lambda: False)():
             return None
 
         def check_can_launch() -> _KernelType:

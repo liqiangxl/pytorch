@@ -1916,6 +1916,144 @@ class TritonTemplateKernel(TritonKernel):
         return partial_code
 
 
+class GluonTritonTemplateKernel(TritonTemplateKernel):
+    """Triton template kernel variant emitted as a ``@gluon.jit`` kernel."""
+
+    @classmethod
+    def gen_common_triton_imports(cls) -> str:
+        imports = IndentedBuffer()
+        imports.splice(super().gen_common_triton_imports())
+        imports.splice(
+            """
+            from triton.experimental import gluon as _gluon
+            from triton.experimental.gluon import language as _ttgl
+            from triton.experimental.gluon.language.nvidia.hopper import mbarrier as _mbarrier
+            from triton.experimental.gluon.language.nvidia.hopper import tma as _tma
+            """
+        )
+        return imports.getvalue()
+
+    def jit_lines(self):
+        return super().jit_lines().replace("@triton.jit", "@_gluon.jit")
+
+    def gen_defines(self):
+        return self.defines.replace("tl.constexpr", "_ttgl.constexpr")
+
+    def def_kernel(self, *argnames):
+        """
+        Like TritonTemplateKernel.def_kernel, but prefix arguments are named in
+        the template body. Gluon TMA kernels need this so the TensorDescriptor
+        prefix arg can be referenced directly.
+        """
+        assert all(isinstance(x, str) for x in argnames)
+        assert len(argnames) == len(self.input_nodes), (
+            len(argnames),
+            len(self.input_nodes),
+            self.prefix_args,
+            self.suffix_args,
+        )
+
+        renames = IndentedBuffer(initial_indent=1)
+        epilogue_start = len(self.input_nodes) - self.suffix_args
+
+        for name, input_node in zip(argnames, self.input_nodes):
+            self.named_input_nodes[name] = input_node
+            if input_node.get_name() in V.graph.removed_buffers:
+                continue
+            if input_node.get_name() in self.prologue_fused_inputs:
+                continue
+            self.args.input_buffers[input_node.get_name()] = f"arg_{name}"
+
+        for idx, (name, input_node) in enumerate(zip(argnames, self.input_nodes)):
+            is_template_input = self.prefix_args <= idx < epilogue_start
+            if is_template_input and self.prologue_loads_all_inputs:
+                self.prologue_supported_inputs.add(input_node.get_name())
+            if input_node.get_name() in V.graph.removed_buffers:
+                continue
+            if input_node.get_name() in self.prologue_fused_inputs:
+                continue
+
+            arg_name = self.args.input_buffers[input_node.get_name()]
+            if isinstance(input_node, ir.TMADescriptor):
+                renames.writeline(f"{name} = {arg_name}")
+            elif input_node.get_layout().offset == 0:
+                renames.writeline(f"{name} = {arg_name}")
+            else:
+                offset = texpr(self.rename_indexing(input_node.get_layout().offset))
+                renames.writeline(f"{name} = {arg_name} + {offset}")
+
+        def hook():
+            arg_defs, *_ = self.args.python_argdefs()
+            code = IndentedBuffer()
+            code.splice(self.gen_common_triton_imports())
+            code.splice(self.jit_lines())
+            code.writeline(
+                f"def {self.kernel_name}({', '.join(x.full_name() for x in arg_defs)}):"
+            )
+            with code.indent():
+                code.splice(self.gen_defines())
+                code.splice(renames.getvalue())
+                self.codegen_prologue(code)
+            return code.getvalue()
+
+        return self._register_hook("<DEF_KERNEL>", hook)
+
+    def store_output(self, *args, **kwargs):
+        # The prefix arg is the TensorDescriptor, not a manual epilogue input.
+        prefix_args = self.prefix_args
+        self.prefix_args = 0
+        try:
+            return super().store_output(*args, **kwargs)
+        finally:
+            self.prefix_args = prefix_args
+
+    def call_kernel(
+        self, name: str, node: ir.IRNode | None = None, deallocate_ws: bool = True
+    ):
+        wrapper = V.graph.wrapper_code
+        _, call_args, _, arg_types = self.args.python_argdefs()
+        raw_args = [
+            V.graph.try_get_buffer(arg) if isinstance(arg, str) else None
+            for arg in call_args
+        ]
+        raw_keys = [""] * len(call_args)
+
+        additional_call_args, additional_arg_types = (
+            self.additional_call_args_and_types()
+        )
+
+        if not additional_call_args:
+            assert not V.graph.cpp_wrapper, "cpp_wrapper requires SymbolicGridFn"
+            wrapper.add_import_once(f"import {self.grid_fn.__module__}")
+            meta = wrapper.add_meta_once(self.meta)
+            fn_name = f"{self.grid_fn.__module__}.{self.grid_fn.__name__}"
+            call_args.append(
+                f"*{fn_name}({', '.join(map(pexpr, self.call_sizes))}, {meta})"
+            )
+            arg_types.append(None)
+            raw_args.append(None)
+            raw_keys.append("")
+
+        call_args.extend(additional_call_args)
+        arg_types.extend(additional_arg_types)
+        raw_args.extend([None] * len(additional_call_args))
+        raw_keys.extend([""] * len(additional_call_args))
+
+        wrapper.generate_kernel_call(
+            name,
+            call_args,
+            arg_types=arg_types,
+            raw_args=raw_args,
+            raw_keys=raw_keys,
+            triton_meta=self.triton_meta,
+            inductor_meta=FixedGrid.setup_grid_as_args()
+            if additional_call_args
+            else None,
+            triton=True,
+        )
+        self._emit_post_kernel_code(wrapper, name)
+
+
 class ExternalTritonTemplateKernel(TritonTemplateKernel):
     """TritonTemplateKernel variant for external template backends (e.g. Helion).
 
@@ -3019,6 +3157,10 @@ class TritonTemplate(KernelTemplate):
             allowed_prologue_inps=result.prologue_supported_inputs,
             hint_override=hint_override,
         )
+
+
+class GluonTritonTemplate(TritonTemplate):
+    kernel_type = GluonTritonTemplateKernel
 
 
 class ExternKernelChoice:
