@@ -1055,8 +1055,19 @@ class CachingAutotuner(KernelInterface):
         if not ASTSource:
             raise RuntimeError("Installed triton version too old, please upgrade")
 
+        ast_source_cls = ASTSource
+        try:
+            from triton.experimental.gluon._runtime import (
+                GluonASTSource,
+                GluonJITFunction,
+            )
+            if isinstance(self.fn, GluonJITFunction):
+                ast_source_cls = GluonASTSource
+        except ImportError:
+            pass
+
         compile_args = (
-            ASTSource(
+            ast_source_cls(
                 self.fn,
                 compile_meta["signature"],
                 compile_meta["constants"],
@@ -2342,6 +2353,12 @@ class StaticTritonCompileResult(CompileResult[_T]):
             if inductor_meta.get("store_cubin"):
                 # Requires storing the entire binary
                 raise CannotStaticallyLaunchKernel("store_cubin is enabled")
+
+            if any(
+                isinstance(ty, str) and "NVMMASharedLayout" in ty
+                for ty in getattr(kernel.src, "signature", {}).values()
+            ):
+                raise CannotStaticallyLaunchKernel("Gluon TMA tensor descriptor")
 
             if getattr(kernel.metadata, "launch_pdl", False) or getattr(
                 kernel.metadata, "launch_cooperative_grid", False

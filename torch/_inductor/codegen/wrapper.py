@@ -72,6 +72,7 @@ from .common import (
     CodeGen,
     DeferredLine,
     PythonPrinter,
+    TMADescriptorArg,
     WorkspaceArg,
     WorkspaceZeroMode,
 )
@@ -1517,6 +1518,7 @@ class PythonWrapperCodegen(CodeGen):
         import_str = f"""
             import triton
             import triton.language as tl
+            import triton.tools.tensor_descriptor
             from {triton_heuristics.__name__} import start_graph, end_graph
             """
         if config.triton.autotune_at_compile_time:
@@ -1995,11 +1997,24 @@ class PythonWrapperCodegen(CodeGen):
         call = f"{fn}({args})"
         return call
 
+    def _generate_tma_descriptor_call_gluon(self, desc, apply_size_hints=False):
+        block_shape = desc.block_shape
+        if apply_size_hints:
+            block_shape = V.graph.sizevars.optimization_hints(block_shape)
+
+        tensor_ref = desc.tensor.codegen_reference()
+        fn = "triton.tools.tensor_descriptor.TensorDescriptor.from_tensor"
+        args = f"{tensor_ref}, {block_shape}"
+        call = f"{fn}({args})"
+        return call
+
     def _generate_tma_descriptor_call(self, desc, apply_size_hints=False):
         if isinstance(desc, ir.TMADescriptorExperimental):
             return self._generate_tma_descriptor_call_experimental(
                 desc, apply_size_hints
             )
+        elif isinstance(desc, ir.GluonTensorDescriptor):
+            return self._generate_tma_descriptor_call_gluon(desc, apply_size_hints)
         else:
             assert isinstance(desc, ir.TMADescriptorStable)
             return self._generate_tma_descriptor_call_stable(desc, apply_size_hints)
@@ -2874,11 +2889,27 @@ class PythonWrapperCodegen(CodeGen):
                 add_arg(idx, ConstexprArg(name=key), equals_none=True)
             else:
                 if isinstance(arg, ir.TMADescriptor):
-                    api_type, block_shape, dtype = (
-                        ("stable", arg.block_shape, arg.tensor.get_dtype())
-                        if isinstance(arg, ir.TMADescriptorStable)
-                        else ("experimental", None, None)
-                    )
+                    if isinstance(arg, ir.TMADescriptorStable):
+                        api_type, block_shape, dtype, layout = (
+                            "stable",
+                            arg.block_shape,
+                            arg.tensor.get_dtype(),
+                            None,
+                        )
+                    elif isinstance(arg, ir.GluonTensorDescriptor):
+                        api_type, block_shape, dtype, layout = (
+                            "gluon",
+                            arg.block_shape,
+                            arg.tensor.get_dtype(),
+                            "NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2, transposed=False, fp4_padded=False, cga_layout=[])",
+                        )
+                    else:
+                        api_type, block_shape, dtype, layout = (
+                            "experimental",
+                            None,
+                            None,
+                            None,
+                        )
                     add_arg(
                         idx,
                         TMADescriptorArg(
@@ -2886,6 +2917,7 @@ class PythonWrapperCodegen(CodeGen):
                             api_type=api_type,
                             block_shape=block_shape,
                             dtype=dtype,
+                            layout=layout,
                         ),
                     )
                 elif isinstance(arg, ir.Buffer):
@@ -3277,6 +3309,32 @@ class PythonWrapperCodegen(CodeGen):
                 buf_name = arg
                 self.kernel_autotune_calls.writeline(f"{buf_name} = {value}")
 
+            return buf_name
+        elif isinstance(arg_type, TMADescriptorArg):
+            assert arg_type.source_name is not None
+            assert arg_type.block_shape is not None
+            source_arg = self.kernel_autotune_example_args.get(
+                arg_type.source_name, (arg_type.source_name, "")
+            )[0]
+            if arg_type.api_type == "gluon":
+                assert len(arg_type.block_shape) == 2
+                inner = arg_type.block_shape[1]
+                row_stride = (
+                    f"({inner} * {source_arg}.stride(-1) "
+                    f"if {source_arg}.dim() == 1 else {source_arg}.stride(-2))"
+                )
+                value = (
+                    "triton.tools.tensor_descriptor.TensorDescriptor"
+                    f"({source_arg}, [{source_arg}.numel() // {inner}, {inner}], "
+                    f"[{row_stride}, {source_arg}.stride(-1)], {arg_type.block_shape})"
+                )
+            else:
+                value = (
+                    "triton.tools.tensor_descriptor.TensorDescriptor.from_tensor"
+                    f"({source_arg}, {arg_type.block_shape})"
+                )
+            buf_name = arg
+            self.kernel_autotune_calls.writeline(f"{buf_name} = {value}")
             return buf_name
         elif issubclass(arg_type, sympy.Basic) or isinstance(arg, SymbolicCallArg):
             # arg is a symbol or symbolic expression

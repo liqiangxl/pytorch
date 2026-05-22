@@ -345,6 +345,21 @@ class TestCodegenTriton(InductorTestCase):
         shape_env.axioms[sympy.Eq(Mod(s4, 8), 0)] = sympy.true
         self.assertTrue(sv.statically_known_multiple_of(s4, 8))
 
+    def test_signature_of_gluon_size_dtypes(self):
+        arg = SizeArg("n", sympy.Integer(2))
+        self.assertEqual(
+            triton_utils.signature_of(arg, size_dtype="_ttgl.int32"), "i32"
+        )
+        self.assertEqual(
+            triton_utils.signature_of(arg, size_dtype="ttgl.int32"), "i32"
+        )
+        self.assertEqual(
+            triton_utils.signature_of(arg, size_dtype="_ttgl.int64"), "i64"
+        )
+        self.assertEqual(
+            triton_utils.signature_of(arg, size_dtype="ttgl.int64"), "i64"
+        )
+
     def test_signature_of_fp8_dtypes(self):
         """fp8 dtypes should produce correct Triton pointer signatures via _type_of."""
         expected = {

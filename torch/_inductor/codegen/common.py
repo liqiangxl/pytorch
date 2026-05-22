@@ -296,9 +296,12 @@ class ConstexprArg:
 @dataclasses.dataclass
 class TMADescriptorArg:
     name: str
-    api_type: str  # "experimental" or "stable"
-    block_shape: list[sympy.Expr] | None  # only needed for "stable"
-    dtype: torch.dtype | None  # only needed for "stable"
+    api_type: str  # "experimental", "stable", or "gluon"
+    block_shape: list[sympy.Expr] | None  # only needed for "stable" and "gluon"
+    dtype: torch.dtype | None  # only needed for "stable" and "gluon"
+    layout: str | None = None  # only needed for "gluon"
+    outer_name: str | None = None
+    source_name: str | None = None
 
 
 @dataclasses.dataclass
@@ -1572,6 +1575,7 @@ class KernelArgs:
         self.inplace_buffers: dict[str, InplacedBuffer | RemovedArg] = {}
         self.sizevars: dict[sympy.Expr, str] = {}
         self.workspace_args: list[WorkspaceArg] = []
+        self.tma_descriptor_args: dict[str, TMADescriptorArg] = {}
 
     def __repr__(self) -> str:
         return "KernelArgs({})".format(
@@ -1604,6 +1608,28 @@ class KernelArgs:
         if name.startswith("seed"):
             return self._lookup("seed", self.input_buffers, name)
         return self._lookup("in_ptr", self.input_buffers, name)
+
+    def tma_descriptor(
+        self,
+        outer_name: str,
+        source_name: str,
+        api_type: str,
+        block_shape: list[sympy.Expr],
+        dtype: torch.dtype,
+        layout: str | None = None,
+    ) -> str:
+        if outer_name not in self.tma_descriptor_args:
+            inner_name = f"tma_descriptor{len(self.tma_descriptor_args)}"
+            self.tma_descriptor_args[outer_name] = TMADescriptorArg(
+                name=inner_name,
+                api_type=api_type,
+                block_shape=block_shape,
+                dtype=dtype,
+                layout=layout,
+                outer_name=outer_name,
+                source_name=source_name,
+            )
+        return self.tma_descriptor_args[outer_name].name
 
     def output(self, name: str) -> str:
         if V.graph.scheduler:
@@ -1850,6 +1876,11 @@ class KernelArgs:
                     dtype=V.graph.get_dtype(outer),
                 )
             )
+        for outer, arg in self.tma_descriptor_args.items():
+            arg_defs.append(ArgName(arg.name))
+            call_args.append(outer)
+            arg_types.append(arg)
+            precompile_args.append(arg)
         for outer, inner in self.sizevars.items():
             arg_defs.append(ArgName(inner))
             call_args.append(outer)

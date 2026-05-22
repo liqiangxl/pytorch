@@ -7424,6 +7424,8 @@ class TMADescriptor(ExternKernel):
         assert len(tma_meta) == 2
         if tma_meta[0] == "experimental":
             return TMADescriptorExperimental(tensor, *tma_meta[1])
+        elif tma_meta[0] == "gluon":
+            return GluonTensorDescriptor(tensor, *tma_meta[1])
         else:
             assert tma_meta[0] == "stable"
             return TMADescriptorStable(tensor, *tma_meta[1])
@@ -7516,6 +7518,26 @@ class TMADescriptorStable(TMADescriptor):
     """
 
     def __init__(self, tensor: IRNode, block_shape: list[int | torch.SymInt]):
+        self.block_shape = block_shape
+
+        super().__init__(
+            tensor=tensor,
+            inputs=[tensor],
+            constant_args=block_shape,
+        )
+
+
+class GluonTensorDescriptor(TMADescriptor):
+    """
+    A TMA descriptor for Gluon kernels that cache reduction inputs in shared memory.
+    Uses the Gluon TensorDescriptor API with NVMMASharedLayout.
+    """
+
+    def __init__(
+        self,
+        tensor: IRNode,
+        block_shape: list[int | torch.SymInt],
+    ) -> None:
         self.block_shape = block_shape
 
         super().__init__(

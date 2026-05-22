@@ -229,6 +229,70 @@ class SIMDKernelFeatures:
         else:
             return node.node.data.reduction_hint
 
+    def _reduction_read_sets(self) -> tuple[OrderedSet[str], OrderedSet[str]]:
+        reduction_reads: OrderedSet[str] = OrderedSet()
+        non_reduction_reads: OrderedSet[str] = OrderedSet()
+        for item in self.node_schedule:
+            if item is DisableReduction or item is EnableReduction:
+                continue
+            for dep in item.read_writes.reads:
+                if isinstance(dep, MemoryDep):
+                    if item.is_reduction():
+                        reduction_reads.add(dep.name)
+                    else:
+                        non_reduction_reads.add(dep.name)
+        return reduction_reads, non_reduction_reads
+
+    def has_reused_reduction_input(self) -> bool:
+        """True if any buffer loaded in a reduction node is also loaded later."""
+        return self.get_reused_reduction_input() is not None
+
+    def get_reused_reduction_input(self) -> str | None:
+        """Return a buffer read in both reduction and non-reduction nodes."""
+        reduction_reads, non_reduction_reads = self._reduction_read_sets()
+        for name in reduction_reads:
+            if name in non_reduction_reads:
+                return name
+        return None
+
+    def get_buffer_dtype(self, name: str) -> torch.dtype | None:
+        buf = V.graph.try_get_buffer(name)
+        if buf is None:
+            return None
+        return buf.get_dtype()
+
+    def has_tma_compatible_reused_reduction_input(self, name: str) -> bool:
+        """True when the reused input can be viewed as [outer, reduction]."""
+        buf = V.graph.try_get_buffer(name)
+        if buf is None:
+            return False
+        size = buf.get_size()
+        stride = buf.get_stride()
+        if not size or len(size) != len(stride):
+            return False
+
+        sizevars = V.graph.sizevars
+        if not sizevars.statically_known_equals(size[-1], self.reduction_numel):
+            return False
+        if not sizevars.statically_known_equals(stride[-1], 1):
+            return False
+
+        # The Gluon MVP builds a 2D descriptor whose first dimension is all
+        # non-reduction dimensions flattened together. That is only affine when
+        # every outer dimension before the last row dimension is contiguous.
+        for i in range(len(size) - 2):
+            if not sizevars.statically_known_equals(
+                stride[i], stride[i + 1] * size[i + 1]
+            ):
+                return False
+        return True
+
+    def get_device(self) -> torch.device | None:
+        """Return the device of the first scheduler node."""
+        for node in self.scheduler_nodes():
+            return node.get_device()
+        return None
+
     def memory_stats(
         self, groups_dict: dict[str, sympy.Expr] | None = None
     ) -> MemoryStats:

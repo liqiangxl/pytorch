@@ -446,6 +446,37 @@ class InductorChoices:
         )  # type: ignore[arg-types]
 
     @staticmethod
+    def should_use_gluon_tma_reduction(features: SIMDKernelFeatures) -> bool:
+        """Heuristic to decide if TMA-smem caching should be used for this reduction."""
+        if not config.triton.gluon_tma_reductions:
+            return False
+        if features.get_reduction_hint() != ReductionHint.INNER:
+            return False
+        r_numel = features.reduction_numel
+        if not isinstance(r_numel, (int, sympy.Integer)):
+            return False
+        n = int(r_numel)
+        if n < 4096 or n > 32768:
+            return False
+        if n & (n - 1):
+            return False
+        tma_input = features.get_reused_reduction_input()
+        if tma_input is None:
+            return False
+        if not features.has_tma_compatible_reused_reduction_input(tma_input):
+            return False
+        dtype = features.get_buffer_dtype(tma_input)
+        if dtype != torch.bfloat16:
+            return False
+        device = features.get_device()
+        if device is None or device.type != "cuda":
+            return False
+        props = DeviceProperties.create(device)
+        if props.major is None or props.major < 9:
+            return False
+        return True
+
+    @staticmethod
     def reduction_split_factor(
         device: torch.device,
         reduction_numel_hint: int,

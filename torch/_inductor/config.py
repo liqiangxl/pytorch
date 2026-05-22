@@ -1966,6 +1966,11 @@ class triton:
     # used for debugging cooperative reduction codegen, always generate cooperative_reductions
     force_cooperative_reductions = False
 
+    # Enable Gluon TMA-based reductions that cache input in shared memory
+    gluon_tma_reductions = (
+        os.environ.get("TORCHINDUCTOR_GLUON_TMA_REDUCTIONS", "0") == "1"
+    )
+
     # 0: disable
     # 1/True: enable, use tuning to pick between different subkernels
     # 2: enable, force using persistent reduction (for debugging)
