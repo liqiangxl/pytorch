@@ -37,7 +37,22 @@ def should_unwrap_unspec_arg(name: str):
     return False
 
 
+_GLUON_TO_TRITON_SIZE_DTYPE = {
+    "_ttgl.int32": "tl.int32",
+    "ttgl.int32": "tl.int32",
+    "_ttgl.int64": "tl.int64",
+    "ttgl.int64": "tl.int64",
+}
+
+
+def _canonicalize_size_dtype(size_dtype: str | None) -> str | None:
+    if size_dtype is None:
+        return None
+    return _GLUON_TO_TRITON_SIZE_DTYPE.get(size_dtype, size_dtype)
+
+
 def signature_of(arg: KernelArgType, *, size_dtype: str | None) -> str:
+    size_dtype = _canonicalize_size_dtype(size_dtype)
     if isinstance(arg, TensorArg):
         typ = _type_of(arg.dtype)
         if should_unwrap_unspec_arg(arg.buffer):
@@ -103,13 +118,18 @@ def signature_of(arg: KernelArgType, *, size_dtype: str | None) -> str:
     if isinstance(arg, TMADescriptorArg):
         if arg.api_type == "experimental":
             return "nvTmaDesc"
-        else:
-            # https://github.com/triton-lang/triton/blob/9695baed9b46cf957e08b157bb4133f4a4b331c5/python/triton/runtime/jit.py#L360-L363
-            assert arg.api_type == "stable"
+        if arg.api_type == "gluon":
             assert arg.block_shape is not None
             assert arg.dtype is not None
+            assert arg.layout is not None
             inner = _type_of(arg.dtype)[1:]  # strip the `*`: *fp32 -> fp32
-            return f"tensordesc<{inner}{list(arg.block_shape)}>"
+            return f"tensordesc<{inner}{list(arg.block_shape)},{arg.layout}>"
+        # https://github.com/triton-lang/triton/blob/9695baed9b46cf957e08b157bb4133f4a4b331c5/python/triton/runtime/jit.py#L360-L363
+        assert arg.api_type == "stable"
+        assert arg.block_shape is not None
+        assert arg.dtype is not None
+        inner = _type_of(arg.dtype)[1:]  # strip the `*`: *fp32 -> fp32
+        return f"tensordesc<{inner}{list(arg.block_shape)}>"
     if isinstance(arg, ConstexprArg):
         return "constexpr"
     raise NotImplementedError(f"unhandled {type(arg)}: {arg}")
