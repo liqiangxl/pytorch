@@ -526,6 +526,9 @@ class OpsHandler(Generic[T]):
     def add(self, x0: T, x1: T) -> T:
         raise NotImplementedError
 
+    def sym_sum(self, args: list[T]) -> T:
+        raise NotImplementedError
+
     def sub(self, x0: T, x1: T) -> T:
         raise NotImplementedError
 
@@ -534,6 +537,9 @@ class OpsHandler(Generic[T]):
 
     # NB: this returns a float, like the torch operation
     def pow(self, x0: T, x1: T) -> T:
+        raise NotImplementedError
+
+    def pow_by_natural(self, x0: T, x1: T) -> T:
         raise NotImplementedError
 
     def and_(self, x0: T, x1: T) -> T:
@@ -720,6 +726,10 @@ class OpsHandler(Generic[T]):
         """C-style modulus, take sign from LHS (x0)."""
         raise NotImplementedError
 
+    def python_mod(self, x0: T, x1: T) -> T:
+        """Python-style modulus, take sign from RHS (x1)."""
+        raise NotImplementedError
+
     def remainder(self, x0: T, x1: T) -> T:
         """Python-style modulus, take sign from RHS (x1)."""
         raise NotImplementedError
@@ -884,6 +894,15 @@ class BasicMathOpsMixin:
     def add(a, b):
         return f"{a} + {b}"
 
+    @classmethod
+    def sym_sum(cls, args):
+        if len(args) == 0:
+            return "0"
+        acc = args[0]
+        for arg in args[1:]:
+            acc = cls.add(acc, arg)
+        return acc
+
     @staticmethod
     def sub(a, b):
         return f"{a} - {b}"
@@ -908,6 +927,14 @@ class BasicMathOpsMixin:
     @staticmethod
     def pow(a, b):
         return f"{a} ** {b}"
+
+    @staticmethod
+    def pow_by_natural(a, b):
+        return f"{a} ** {b}"
+
+    @staticmethod
+    def python_mod(a, b):
+        return f"{a} % {b}"
 
     @staticmethod
     def lshift(a, b):

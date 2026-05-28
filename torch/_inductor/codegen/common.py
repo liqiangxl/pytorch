@@ -39,6 +39,7 @@ from ..shape_propagation import ShapePropagationOpsHandler
 from ..utils import (
     boolean_ops,
     DeferredLineBase,
+    device_supports_fp64,
     generate_assert,
     get_current_backend,
     IndentedBuffer,
@@ -59,6 +60,22 @@ from ..virtualized import (
     StoreMode,
     V,
 )
+
+
+def unbacked_float_dtype() -> torch.dtype:
+    current_device = getattr(V.graph, "current_device", None)
+    if config._use_fp64_for_unbacked_floats and device_supports_fp64(current_device):
+        return torch.float64
+    return torch.float32
+
+
+def integer_sizevar_dtype(arg_name: str) -> torch.dtype:
+    if config.triton.use_block_ptr and arg_name.startswith("ks"):
+        try:
+            return V.kernel.get_index_dtype_as_torch_dtype()
+        except AttributeError:
+            pass
+    return torch.int64
 
 
 if TYPE_CHECKING:
@@ -1574,6 +1591,7 @@ class KernelArgs:
         self.output_buffers: dict[str, str | RemovedArg] = {}
         self.inplace_buffers: dict[str, InplacedBuffer | RemovedArg] = {}
         self.sizevars: dict[sympy.Expr, str] = {}
+        self.sizevar_dtypes: dict[sympy.Expr, torch.dtype] = {}
         self.workspace_args: list[WorkspaceArg] = []
 
     def __repr__(self) -> str:
@@ -1730,14 +1748,22 @@ class KernelArgs:
                 f"{name}{sum(1 for v in self.sizevars.values() if v.startswith(name))}"
             )
         self.sizevars[value] = name
+        self.sizevar_dtypes.setdefault(value, torch.int64)
         return name
 
     def size(self, name: sympy.Symbol) -> str:
         assert isinstance(name, sympy.Symbol), (type(name), name)
         if name.name == "seed":
             self.sizevars[name] = "seed"  # don't manage the name of seeds
+            self.sizevar_dtypes.setdefault(name, torch.int64)
             return "seed"
-        return self._lookup("ks", self.sizevars, name)
+
+        arg_name = self._lookup("ks", self.sizevars, name)
+        if symbol_is_type(name, SymT.UNBACKED_FLOAT):
+            self.sizevar_dtypes.setdefault(name, unbacked_float_dtype())
+        else:
+            self.sizevar_dtypes.setdefault(name, integer_sizevar_dtype(arg_name))
+        return arg_name
 
     def call_names(self) -> Iterator[str]:
         return chain(
@@ -2660,7 +2686,7 @@ class CSEProxy(DefaultHandler):
         output_dtype = None
         output_shape = None
 
-        if name == "masked" and backend == "triton":
+        if name in ("masked", "index_expr") and backend == "triton":
             output_dtype = value.dtype
             output_shape = value.shape
         elif name == "masked" and backend == "cpp":

@@ -273,6 +273,10 @@ class DtypePropagationOpsHandler:
         return promote_types([a, b])
 
     @staticmethod
+    def sym_sum(args: Sequence[DTypeArg]) -> torch.dtype:
+        return promote_types(args)
+
+    @staticmethod
     def truediv(a: DTypeArg, b: DTypeArg) -> torch.dtype:
         return promote_types([a, b])
 
@@ -296,7 +300,15 @@ class DtypePropagationOpsHandler:
         return dtype
 
     @staticmethod
+    def pow_by_natural(a: DTypeArg, b: DTypeArg) -> torch.dtype:
+        return promote_types([a, b])
+
+    @staticmethod
     def mod(a: DTypeArg, b: DTypeArg) -> torch.dtype:
+        return promote_types([a, b])
+
+    @staticmethod
+    def python_mod(a: DTypeArg, b: DTypeArg) -> torch.dtype:
         return promote_types([a, b])
 
     @staticmethod

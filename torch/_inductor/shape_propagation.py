@@ -94,6 +94,10 @@ class ShapePropagationOpsHandler:
         return None
 
     @staticmethod
+    def sym_sum(args: Sequence[ShapeArg]) -> BlockShapeType:
+        return broadcast_shapes_for_args(args)
+
+    @staticmethod
     def reduction(
         dtype: torch.dtype,
         src_dtype: torch.dtype,

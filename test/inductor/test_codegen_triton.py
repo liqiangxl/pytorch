@@ -8,7 +8,7 @@ import sympy
 import torch
 import torch._inductor.config as inductor_config
 from torch._inductor.codegen import triton_utils
-from torch._inductor.codegen.common import CSEVariable, SizeArg, TensorArg
+from torch._inductor.codegen.common import CSEVariable, KernelArgs, SizeArg, TensorArg
 from torch._inductor.codegen.simd import IterationRangesRoot
 from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
 from torch._inductor.codegen.triton import (
@@ -29,6 +29,7 @@ from torch.testing._internal.inductor_utils import (
     HAS_GPU_AND_TRITON,
 )
 from torch.utils._sympy.functions import FloorDiv, TruncToFloat, TruncToInt
+from torch.utils._sympy.symbol import make_symbol, SymT
 from torch.utils._sympy.value_ranges import ValueRanges
 
 
@@ -49,6 +50,48 @@ class TestCodegenTriton(InductorTestCase):
     def tearDown(self):
         self._stack.close()
         super().tearDown()
+
+    @inductor_config.patch("_use_fp64_for_unbacked_floats", True)
+    def test_kernel_args_unbacked_float_respects_fp64_config(self):
+        symbol = make_symbol(SymT.UNBACKED_FLOAT, 0)
+
+        with patch(
+            "torch._inductor.codegen.common.device_supports_fp64", return_value=True
+        ):
+            args = KernelArgs()
+            args.size(symbol)
+            self.assertEqual(args.sizevar_dtypes[symbol], torch.float64)
+
+        with patch(
+            "torch._inductor.codegen.common.device_supports_fp64", return_value=False
+        ):
+            args = KernelArgs()
+            args.size(symbol)
+            self.assertEqual(args.sizevar_dtypes[symbol], torch.float32)
+
+    def test_kernel_args_integer_size_respects_block_ptr_index_dtype(self):
+        class FakeKernel:
+            @staticmethod
+            def get_index_dtype_as_torch_dtype():
+                return torch.int32
+
+        symbol = make_symbol(SymT.SIZE, 0)
+
+        with (
+            inductor_config.patch("triton.use_block_ptr", True),
+            V.set_kernel_handler(FakeKernel()),
+        ):
+            args = KernelArgs()
+            self.assertEqual(args.size(symbol), "ks0")
+            self.assertEqual(args.sizevar_dtypes[symbol], torch.int32)
+
+        with (
+            inductor_config.patch("triton.use_block_ptr", False),
+            V.set_kernel_handler(FakeKernel()),
+        ):
+            args = KernelArgs()
+            args.size(symbol)
+            self.assertEqual(args.sizevar_dtypes[symbol], torch.int64)
 
     def test_range_tree_entry_ownership_uses_root_identity(self):
         class AlternateR0Root(IterationRangesRoot):
