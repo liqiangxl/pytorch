@@ -15,6 +15,11 @@
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
 
+#if !defined(USE_ROCM) && !defined(_WIN32) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+#include <ATen/native/cuda/TMAScatterAdd.h>
+#define BUILD_TMA_SCATTER_ADD
+#endif
+
 namespace at::native {
 
 // Implement as functors since lambdas don't get optimized.
@@ -577,6 +582,58 @@ void scatter_fill_cuda_kernel(const Tensor& self, int64_t dim, const Tensor& ind
 }
 
 void scatter_add_cuda_kernel(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src) {
+#if defined(BUILD_TMA_SCATTER_ADD)
+  // TMA bulk-reduce fast path for scatter_add_ on Hopper+ (SM90).
+  // Currently limited to 2D tensors with dim=0:
+  //   self[M, D].scatter_add_(0, index[N, D], src[N, D])
+  // Each row of D elements is reduced atomically via cp.reduce.async.bulk,
+  // replacing D individual atomicAdd calls.
+  do {
+    if (self.dim() != 2 || src.dim() != 2 || index.dim() != 2 || dim != 0) break;
+    if (!self.is_contiguous() || !src.is_contiguous()) break;
+    auto dtype = self.scalar_type();
+    if (dtype != kBFloat16 && dtype != kHalf && dtype != kFloat) break;
+    auto idx_dtype = index.scalar_type();
+    if (idx_dtype != kLong && idx_dtype != kInt) break;
+    // TMA requires 16-byte aligned global memory addresses.
+    if (reinterpret_cast<uintptr_t>(self.data_ptr()) % 16 != 0) break;
+    if (reinterpret_cast<uintptr_t>(src.data_ptr()) % 16 != 0) break;
+    if (at::cuda::getCurrentDeviceProperties()->major < 9) break;
+
+    // Non-scatter dims must match.
+    if (self.size(1) != src.size(1) || self.size(1) != index.size(1)) break;
+
+    // Index must be broadcast (stride 0) on dim 1 so that every element
+    // in a row maps to the same destination row.
+    if (index.stride(1) != 0) break;
+
+    // TMA requires the transfer size to be a multiple of 16 bytes.
+    int64_t D = self.size(1);
+    if ((D * src.element_size()) % 16 != 0) break;
+
+    // Pick rows_per_block: largest that fits in device smem while keeping
+    // enough blocks for good SM occupancy.
+    size_t row_bytes = D * src.element_size();
+    int max_smem = at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+    int num_sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    int64_t N = src.size(0);
+    int64_t min_blocks = 4L * num_sms;
+    int rows_per_block = 0;
+    for (int rpb : {16, 8, 4, 2, 1}) {
+      size_t smem = rpb * row_bytes + rpb * sizeof(uint64_t);
+      if (static_cast<int>(smem) > max_smem) continue;
+      int64_t num_blocks = (N + rpb - 1) / rpb;
+      if (num_blocks >= min_blocks || rpb == 1) {
+        rows_per_block = rpb;
+        break;
+      }
+    }
+    if (rows_per_block == 0) break;
+
+    tma_scatter_add_dispatch(self, dim, index, src, rows_per_block);
+    return;
+  } while (false);
+#endif
   cuda_scatter_gather_base_kernel</*is_scatter_like=*/true, /*cast_to_opaque=*/false>()(
     self, dim, index, src,
     "scatter_add_cuda_", reduce_add);
